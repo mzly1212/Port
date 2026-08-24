@@ -11,6 +11,9 @@ from config import Config
 from data import ProcessedVehicle, ProcessedFrame
 from output_adapter import ProtocolAdapter
 
+"""
+克隆 修改 提交 测试
+"""
 
 class ReplaySender:
     def __init__(self, mode: str = "fixed", speed: float = 1.0, loop: bool = False,

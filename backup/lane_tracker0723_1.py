@@ -1,0 +1,755 @@
+import math
+import time
+from collections import deque
+from data import ProcessedVehicle
+from config import Config
+import numpy as np
+from shapely.geometry import Point
+
+
+class VehicleState:
+    def __init__(self, obj_id, lane_id, s, l_offset, v, attrs, current_time, rel_x, rel_y, raw_heading):
+        self.fixed_id = obj_id
+        self.lane_id = lane_id
+        self.s = s  # 纵向距离
+        self.l = l_offset  # 横向偏移
+        self.filtered_l = l_offset  # 滤波后的横向偏移
+        self.v = v  # 当前速度
+        self.attrs = attrs  # 业务透传属性
+        self.last_radar_time = current_time
+        self.first_seen_time = current_time  # 记录存活资历，用于消灭后来分裂出的李鬼
+        self.is_off_lane = False  # 离线标识
+
+        # 变道意图确认状态机
+        self.pending_lane_id = None
+        self.lane_change_counter = 0
+
+        # fallback 2D 坐标 (用于离线游离状态)
+        self.raw_x = rel_x
+        self.raw_y = rel_y
+        self.raw_heading = raw_heading
+
+        # 5秒历史轨迹队列 (10Hz下50帧)
+        self.s_history = deque(maxlen=50)
+        self.s_history.append((current_time, s))
+
+        # 最终输出平滑坐标缓存
+        self.out_x = None
+        self.out_y = None
+
+        self.last_lane_id = lane_id  # 记录最后绑定车道
+        self.last_s = s  # 记录最后S坐标
+        self.pred_x = None  # 预测坐标缓存
+        self.pred_y = None
+        # ===== 新增：幽灵推演车追击机制 =====
+        self.target_s = s  # 真实雷达车所在的位置 (物理层)
+        self.is_chasing = False  # 是否处于推演车追击状态
+        # =====新增：海一路入场轨迹拟合相关状态======
+        self.xy_history = deque(maxlen=30)  # 记录最近 3 秒的真实 2D 坐标
+        self.haiyi_fitted_heading = None  # 缓存的平滑拟合航向 (地理角)
+
+        # ===== 新增：平滑变道过渡动画机制 =====
+        self.is_changing_lane = False
+        self.lc_start_time = 0
+        self.lc_duration = 2000  # 变道动画持续时间 2000ms (2秒，可根据前端视觉效果微调)
+        self.lc_offset_x = 0.0
+        self.lc_offset_y = 0.0
+        self.lc_offset_heading = 0.0
+
+        # ===== 新增：海一路逆行变道控制 =====
+        self.out_heading = raw_heading  # 缓存用于前端渲染的视觉航向角
+        self.is_reverse_driving = False  # 是否处于逆行借道状态
+        self.signed_v = 0.0  # ✅ 新增：记录带有方向的真实 S 轴速度
+
+    def update_s_and_chase(self, current_time, raw_s):
+        """处理真实坐标更新，并触发/维持推演车追击状态"""
+        # 1. 速度估算永远依赖【真实雷达点】，将抗噪任务全权交给后续的最小二乘法 (允许轻微噪点回退)
+        self.v = self.update_and_estimate_speed(current_time, raw_s)
+        self.target_s = raw_s  # 物理层永远保持为真实的雷达纵向坐标
+
+        # 2. 判断是否刚从断联中恢复
+        was_predicted = (current_time - self.last_radar_time > 100) # 300
+
+        if not self.is_chasing:
+            # 如果刚恢复，且物理偏差大于 2 米，触发幽灵车追击！
+            if was_predicted and abs(self.s - self.target_s) > 4.0: # 2.0
+                self.is_chasing = True
+                # 注意：此时 self.s 保持不变（停留在推演车当前位置），仅 target_s 变为真实位置
+            else:
+                # ==========================================
+                # 🚀 新增：常态防后退/防瞬移 (单向棘轮) 机制
+                # 彻底解决雷达噪点回跳导致的画面拉扯与视觉倒退问题
+                # ==========================================
+                if self.signed_v > 0.5:
+                    # 明确正向行驶中：不允许 S 减小。若雷达噪点回跳，停在原地等待真实信号跟上
+                    if self.target_s < self.s:
+                        pass
+                    else:
+                        self.s = self.target_s
+                elif self.signed_v < -0.5:
+                    # 明确倒车/逆行中：不允许 S 增加。若雷达噪点前跳，停在原地等待
+                    if self.target_s > self.s:
+                        pass
+                    else:
+                        self.s = self.target_s
+                else:
+                    # 车辆几乎静止：完全相信雷达并交给底层的 _alpha_filter_xy 2D平滑
+                    # (防止单向机制导致静止车辆的坐标随噪点不断向前/向后累积蠕动)
+                    self.s = self.target_s
+
+    def update_l(self, raw_l):
+        """对横向偏移 L 进行一阶低通滤波"""
+        alpha = 0.2  # 滤波系数：越小越平滑，抗噪越强 (0.2 相当于极度信任历史)
+        self.filtered_l = self.filtered_l * (1 - alpha) + raw_l * alpha
+        return self.filtered_l
+
+
+    def update_and_estimate_speed(self, current_time, current_s):
+        """
+        利用最小二乘法，对过去 5 秒的历史轨迹进行线性回归，求出最稳定的 S-T 图像斜率(即真实车速)
+        这能彻底免疫雷达短时间内的位置跳动噪点。
+        """
+        self.s_history.append((current_time, current_s))
+
+        # 数据点太少，无法回归，返回 0.0 或上一帧速度
+        if len(self.s_history) < 3: return self.v
+
+        t_list = [h[0] for h in self.s_history]
+        s_list = [h[1] for h in self.s_history]
+
+        # 将时间戳转换为相对秒数 (防止数字过大导致精度丢失)
+        t0 = t_list[0]
+        x = [(t - t0) / 1000.0 for t in t_list]
+        y = s_list
+
+        n = len(x)
+        sum_x = sum(x)
+        sum_y = sum(y)
+        sum_xy = sum(xi * yi for xi, yi in zip(x, y))
+        sum_xx = sum(xi * xi for xi in x)
+
+        denominator = (n * sum_xx - sum_x * sum_x)
+        if denominator == 0: return self.v
+        slope = (n * sum_xy - sum_x * sum_y) / denominator
+
+        # ✅ 新增：记录 S 的真实变化率 (正代表沿车道，负代表逆车道)
+        self.signed_v = slope
+
+        # 物理极限制裁：防止算出离谱速度 (例如限制在 -20m/s 到 +30m/s 之间)
+        return max(0.0, min(30.0, slope))
+
+
+class LaneQueueTracker:
+    def __init__(self, map_manager):
+        self.last_update_time = None
+        self.map_mgr = map_manager
+        # 核心数据结构：按 lane_id 分组维护车辆列表
+        self.lane_queues = {}
+        self.active_vehicles = {}  # fixed_id -> VehicleState
+
+    def process_frame(self, raw_vehicles, current_time):
+        current_radar_ids = set()
+
+        # 🚀 预处理：先找出本帧已经有明确 ID 匹配的在线健康车辆
+        # 这些车辆获得了真正的雷达点，绝不能再让其他噪点或断联车去缝合/吸附它们！
+        direct_match_ids = {rv.object_id for rv in raw_vehicles if rv.object_id in self.active_vehicles}
+
+        for rv in raw_vehicles:
+            # ==========================================
+            # 提取历史状态，辅助更鲁棒的车道匹配
+            # ==========================================
+            fixed_id = rv.object_id
+            old_veh = self.active_vehicles.get(fixed_id)
+
+            veh_v = old_veh.v if old_veh else 0.0
+            last_lane = old_veh.lane_id if old_veh else None
+
+            # 默认使用雷达瞬时航向
+            veh_heading = rv.radar_heading
+
+            # # ==========================================
+            # # 🚀 改进：海一路 (137438953506西侧) 入轨轨迹拟合
+            # # ==========================================
+            # if old_veh:
+            #     # 不断收集原始物理坐标
+            #     old_veh.xy_history.append((rv.rel_x, rv.rel_y))
+            #
+            #     if '137438953506' in self.map_mgr.lanes:
+            #         line_506 = self.map_mgr.lanes['137438953506']['line']
+            #         pt = Point(rv.rel_x, rv.rel_y)
+            #         dist_506 = line_506.distance(pt)
+            #
+            #         # 1. 车辆游离在外侧感知区 (2.5m~8.0m)，且尚未匹配入轨，进行线性拟合
+            #         if 2.5 <= dist_506 <= 8.0 and old_veh.is_off_lane:
+            #             if len(old_veh.xy_history) >= 5:
+            #                 xs = [p[0] for p in old_veh.xy_history]
+            #                 ys = [p[1] for p in old_veh.xy_history]
+            #
+            #                 # 屏蔽完全静止或垂直线导致的拟合报错
+            #                 if max(xs) - min(xs) > 0.01:
+            #                     m, b = np.polyfit(xs, ys, 1)
+            #                     dx = xs[-1] - xs[0]
+            #                     dy = ys[-1] - ys[0]
+            #
+            #                     vec_base = np.array([1, m])
+            #                     vec_points = np.array([dx, dy])
+            #
+            #                     # 根据首尾点确定向量真实指向，避免180度歧义
+            #                     direction_sign = 1 if np.dot(vec_base, vec_points) >= 0 else -1
+            #                     vec_fit = direction_sign * vec_base
+            #                     math_heading = math.degrees(math.atan2(vec_fit[1], vec_fit[0]))
+            #                 else:
+            #                     # 极度垂直情况直接取 Y 轴方向
+            #                     math_heading = 90.0 if ys[-1] > ys[0] else -90.0
+            #
+            #                 # 转换为雷达匹配用的地理航向 (0北 90东)
+            #                 old_veh.haiyi_fitted_heading = (90 - math_heading) % 360
+            #
+            #         # 2. 驶离过远，清除废弃缓存
+            #         elif dist_506 > 8.0:
+            #             old_veh.haiyi_fitted_heading = None
+            #
+            #         # 3. 逼近车道界限 (< 2.5m)，劫持雷达航向以提高匹配准确度！
+            #         if dist_506 < 2.5 and old_veh.haiyi_fitted_heading is not None:
+            #             veh_heading = old_veh.haiyi_fitted_heading
+            #             print(f'=====heading_linear: {int(fixed_id)%10000}: {veh_heading}==========')
+            #             # 如果已成功上轨并受车道粘滞保护，清除缓存完成使命
+            #             if not old_veh.is_off_lane:
+            #                 old_veh.haiyi_fitted_heading = None
+
+            # 1. 初始雷达点映射
+            lane_id, s, l = self.map_mgr.match_to_lane(
+                rv.rel_x, rv.rel_y,
+                veh_heading=veh_heading,
+                v=veh_v,
+                last_lane_id=last_lane,
+                base_max_dist=2.5  # 基础阈值设为 3.0 米
+            )
+
+            attrs = {
+                "itc_obj_type": rv.itc_obj_type,
+                "plate_num": rv.plate_num,
+                "lane_no": rv.lane_no,
+                "type_reliability": rv.type_reliability,
+                "itc_sub_type": rv.itc_sub_type
+            }
+
+            fixed_id = rv.object_id
+
+            # ==========================================
+            # 防劫持护盾 (将会车错乱限制在海一路)
+            # ==========================================
+            if fixed_id in self.active_vehicles:
+                old_veh = self.active_vehicles[fixed_id]
+                dt_sec = max((current_time - old_veh.last_radar_time) / 1000.0, 0.1)
+                is_hijacked = False
+
+                # 基础物理位移护盾 (全地图通用)：收紧至 15.0*dt + 4.0
+                dist_2d = math.hypot(rv.rel_x - old_veh.raw_x, rv.rel_y - old_veh.raw_y)
+                if dist_2d > (20.0 * dt_sec + 4.0):
+                    is_hijacked = True
+                    print(f'hijack fixed: T  ->  {int(fixed_id)%10000}')
+
+
+                # 🛡️ 海一路专属会车防错乱护盾 (仅在 490 和 506 车道生效)
+                haiyi_lanes = {'137438953490', '137438953506'}
+                if old_veh.lane_id in haiyi_lanes:
+                    # 检查 A: 会车瞬间跳向了方向相反的对向车道，且没有触发合法借道意图
+                    if lane_id in haiyi_lanes and lane_id != old_veh.lane_id:
+                        if old_veh.lane_change_counter == 0:
+                            is_hijacked = True
+                            print('hijack fixed: A')
+
+                    # 检查 B: 雷达航向角突变 (>90度说明在对向车道会车时误认成了来车)
+                    heading_jump = abs((old_veh.raw_heading - rv.radar_heading + 180) % 360 - 180)
+                    if heading_jump > 90 and dt_sec < 1.0 and not getattr(old_veh, 'is_reverse_driving', False):
+                        is_hijacked = True
+                        print('hijack fixed: B')
+
+                if is_hijacked:
+                    # 💡 核心修复：判定为错乱或劫持时，直接丢弃该噪点(continue)
+                    # 绝不生成随机临时ID，彻底从源头掐灭“幽灵发生器”和图标拖尾！
+
+                    continue
+
+            # ==========================================
+            # 全域 2D 物理缝合 (解决换道残留)
+            # ==========================================
+            if fixed_id not in self.active_vehicles:
+                matched_id = self._find_best_match_2d(rv.rel_x, rv.rel_y, rv.radar_heading, current_time)
+                if matched_id:
+                    fixed_id = matched_id
+
+            # 【单帧去重防抖】
+            if fixed_id in current_radar_ids: continue
+            current_radar_ids.add(fixed_id)
+
+            # ==========================================
+            # 最终状态更新 (融合变道迟滞确认机制)
+            # ==========================================
+            if lane_id is None:
+                self._update_off_lane_vehicle(fixed_id, rv, attrs, current_time)
+                continue
+
+            if fixed_id not in self.active_vehicles:
+                self.active_vehicles[fixed_id] = VehicleState(fixed_id, lane_id, s, l, 0.0, attrs, current_time,
+                                                              rv.rel_x, rv.rel_y, rv.radar_heading)
+            else:
+                veh = self.active_vehicles[fixed_id]
+
+                if veh.lane_id == lane_id:
+                    # 【情况 A：正常同车道行驶】
+                    veh.pending_lane_id = None
+                    veh.lane_change_counter = 0
+                    veh.update_l(l)  # 刷新滤波 L
+                    veh.update_s_and_chase(current_time, s)  # ✅ 应用追击逻辑
+                    veh.lane_id = lane_id
+
+                elif veh.lane_id is not None:
+                    # 【情况 B：触发变道意图 (老车道 -> 新车道)】
+                    if veh.pending_lane_id == lane_id:
+                        veh.lane_change_counter += 1
+                    else:
+                        veh.pending_lane_id = lane_id
+                        veh.lane_change_counter = 1
+
+                    # 计算它相对【老车道】的真实横向距离，并丢入低通滤波
+                    old_line = self.map_mgr.lanes[veh.lane_id]['line']
+                    pt = Point(rv.rel_x, rv.rel_y)
+                    # dist_to_old = old_line.distance(pt)
+                    dist_to_old = self.map_mgr.get_signed_offset(veh.lane_id, rv.rel_x, rv.rel_y)
+                    veh.update_l(dist_to_old)
+
+                    # 门限确认：连续 5 帧匹配到同一新车道，且滤波后的偏离距离 > 1.2 米
+                    if veh.lane_change_counter >= 5 and abs(veh.filtered_l) > 3:  # 1.2
+                        # ==========================================
+                        # 🚀 新增：变道平滑过渡机制 (目前仅针对海一路双向车道特化)
+                        # ==========================================
+                        haiyi_lanes = {'137438953490', '137438953506'}
+                        if veh.lane_id in haiyi_lanes and lane_id in haiyi_lanes:
+                            new_x, new_y = self.map_mgr.get_xy_from_s(lane_id, s)
+                            if new_x is not None:
+                                veh.is_changing_lane = True
+                                veh.lc_start_time = current_time
+
+                                start_x = veh.out_x if veh.out_x is not None else veh.raw_x
+                                start_y = veh.out_y if veh.out_y is not None else veh.raw_y
+                                veh.lc_offset_x = start_x - new_x
+                                veh.lc_offset_y = start_y - new_y
+
+                                new_map_heading = self.map_mgr.lanes[lane_id]['heading']
+                                target_geo = (90 - new_map_heading) % 360
+
+                                # 判定逆行：对比雷达原生航向与新车道正常航向 (如果反向，说明是逆行超车)
+                                angle_diff = abs((target_geo - veh.raw_heading + 180) % 360 - 180)
+                                if angle_diff > 90:
+                                    veh.is_reverse_driving = True
+                                    target_geo = (target_geo + 180) % 360
+                                else:
+                                    veh.is_reverse_driving = False
+
+                                start_heading = getattr(veh, 'out_heading', veh.raw_heading)
+                                veh.lc_offset_heading = (start_heading - target_geo + 180) % 360 - 180
+                        else:
+                            veh.is_changing_lane = False
+                            veh.is_reverse_driving = False
+                        # ==========================================
+                        # ✅ 正式确认变道！
+                        veh.s_history.clear()
+                        veh.signed_v = 0.0  # <--- 新增：清空历史的同时重置方向速度
+                        veh.lane_id = lane_id
+                        # 变道瞬间允许硬切重置，打断追击防止跨车道错乱
+                        veh.target_s = s
+                        veh.s = s
+                        veh.is_chasing = False
+
+                        veh.v = veh.update_and_estimate_speed(current_time, s)
+                        veh.filtered_l = l
+                        veh.pending_lane_id = None
+                        veh.lane_change_counter = 0
+                    else:
+                        # ❌ 仍在确认期或意图不足，拒绝瞬间跨道！
+                        lane_id = veh.lane_id
+                        s = old_line.project(pt)
+                        # --- 替换旧的纵向更新逻辑 ---
+                        veh.update_s_and_chase(current_time, s)  # ✅ 拒识变道时，依然应用沿车道追击
+
+                else:
+                    # 【情况 C：之前是离线游离状态，现在成功上轨 (车辆入道)】
+                    # ======== 新增：记录入道瞬间的时空偏差 ========
+                    new_x, new_y = self.map_mgr.get_xy_from_s(lane_id, s)
+                    if new_x is not None:
+                        veh.is_changing_lane = True
+                        veh.lc_start_time = current_time
+
+                        # 视觉起点：优先用之前的平滑输出坐标，若无则用当前真实的 2D 坐标
+                        start_x = veh.out_x if veh.out_x is not None else veh.raw_x
+                        start_y = veh.out_y if veh.out_y is not None else veh.raw_y
+                        veh.lc_offset_x = start_x - new_x
+                        veh.lc_offset_y = start_y - new_y
+
+                        # 计算航向角偏差（预测目标车道地理角，并兼容 180 度倒车翻转）
+                        new_map = self.map_mgr.lanes[lane_id]['heading']
+                        target_geo = (90 - new_map) % 360
+
+                        # === [修改] 海一路入道逆行判定 ===
+                        haiyi_lanes = {'137438953490', '137438953506'}
+                        if lane_id in haiyi_lanes:
+                            angle_diff = abs((target_geo - veh.raw_heading + 180) % 360 - 180)
+                            if angle_diff > 90:
+                                veh.is_reverse_driving = True
+                                target_geo = (target_geo + 180) % 360
+                            else:
+                                veh.is_reverse_driving = False
+                        else:
+                            veh.is_reverse_driving = False
+                            # 保留原有其他车道的掉头兼容逻辑
+                            angle_diff = abs((target_geo - veh.raw_heading + 180) % 360 - 180)
+                            if angle_diff > 150 and (lane_id != '137438953490'):
+                                target_geo = (target_geo + 180) % 360
+
+                        start_heading = getattr(veh, 'out_heading', veh.raw_heading)
+                        veh.lc_offset_heading = (start_heading - target_geo + 180) % 360 - 180
+                    # ==========================================
+
+                    veh.s_history.clear()
+                    veh.signed_v = 0.0  # <--- 新增：同样重置
+                    veh.lane_id = lane_id
+                    veh.s = s
+                    veh.target_s = s
+                    veh.is_chasing = False
+                    veh.update_l(l)
+                    veh.v = veh.update_and_estimate_speed(current_time, s)
+                    veh.pending_lane_id = None
+                    veh.lane_change_counter = 0
+
+
+                    veh.out_x = veh.raw_x
+                    veh.out_y = veh.raw_y
+
+                # 统一更新基础属性
+                veh.attrs = attrs
+                veh.last_radar_time = current_time
+                veh.is_off_lane = False
+                veh.raw_x = rv.rel_x
+                veh.raw_y = rv.rel_y
+                veh.raw_heading = rv.radar_heading
+
+        self._update_physics_queues(current_time, current_radar_ids)
+        self._cleanup_stale_vehicles(current_time)
+        return self._generate_processed_vehicles(current_time)
+
+    def _find_best_match_2d(self, rel_x, rel_y, rv_heading, current_time):
+        """
+        🚀 全域 2D 物理缝合（融合版）：
+        1. 严格保留原版“极近距离瞬间分裂噪点”的消除机制
+        2. 将会车方向互斥严格限制在海一路(490/506)，彻底杜绝会车错乱与图标残留
+        """
+        haiyi_lanes = {'137438953490', '137438953506'}
+        best_id = None
+        min_dist = float('inf')
+
+        for v_id, veh in self.active_vehicles.items():
+            dist = math.hypot(veh.raw_x - rel_x, veh.raw_y - rel_y)
+            time_diff = current_time - veh.last_radar_time
+            dt_sec = max(time_diff / 1000.0, 0.1)
+
+            # ==========================================
+            # 🛡️ 隔离防线：海一路专属 - 运动学方向一票否决
+            # ==========================================
+            # 即使雷达点就在车身身边（dist < 20.0），只要当前车在海一路上，
+            # 且雷达点的航向与历史航向相反（夹角 > 90°），说明这绝对是对向会车车辆的点！
+            # 直接一票否决，绝不允许把对向车的点当成自己的分裂噪点认领！
+            if veh.lane_id in haiyi_lanes:
+                angle_diff = abs((veh.raw_heading - rv_heading + 180) % 360 - 180)
+                if angle_diff > 90 and not getattr(veh, 'is_reverse_driving', False):
+                    continue
+
+            # ==========================================
+            # 🚀 核心缝合：完整复用原版的两类经典场景
+            # ==========================================
+            is_match = False
+
+            # 场景 1: 无论是否换道/离线，只要断联且在合理距离内，大概率是它
+            # (这里将原版固定的 50.0 米优化为随失联时间动态扩口，最远不超过 30 米)
+            max_allow_dist = min(30.0, 15.0 + veh.v * dt_sec)
+            if time_diff > 100 and dist < 50.0:
+                is_match = True
+
+            # 场景 2: 极近距离雷达瞬间分裂噪点
+            # (即使 time_diff <= 100 甚至本帧已匹配过，只要 < 20米，均强行认领！
+            # 认领后，外部的 `if fixed_id in current_radar_ids: continue` 会将分裂噪点作为重复项完美抹除)
+            elif dist < 20.0:  # 15
+                is_match = True
+
+            if is_match and dist < min_dist:
+                min_dist = dist
+                best_id = v_id
+
+        return best_id
+
+    def _update_physics_queues(self, current_time, current_radar_ids):
+        # 初始化时间步长
+        if self.last_update_time is None:
+            self.last_update_time = current_time
+        dt = (current_time - self.last_update_time) / 1000.0
+        if dt <= 0:
+            dt = 0.1  # 安全保护
+
+        self.lane_queues.clear()
+
+        # 收集所有有车道信息的车辆（包括离线但有 last_lane_id 的）
+        for veh in self.active_vehicles.values():
+            if not veh.is_off_lane and veh.lane_id is not None:
+                lane = veh.lane_id
+                s = veh.s
+                if lane not in self.lane_queues:
+                    self.lane_queues[lane] = []
+                self.lane_queues[lane].append((veh, s))  # 存储 (vehicle, s) 元组
+
+        for lane_id, items in self.lane_queues.items():
+            # 按 s 降序排序
+            items.sort(key=lambda x: x[1], reverse=True)
+
+            # ----- 去重逻辑（基于 s 和速度差）-----
+            survivors = []
+            for veh, s_val in items:
+                if not survivors:
+                    survivors.append((veh, s_val))
+                else:
+                    leader_veh, leader_s = survivors[-1]
+                    if (leader_s - s_val) < 18.0 and abs(leader_veh.v - veh.v) < 2.0:
+                        # 合并：删除后出现的（或资历浅的）
+                        if leader_veh.first_seen_time <= veh.first_seen_time:
+                            ghost = veh
+                        else:
+                            ghost = leader_veh
+                            survivors[-1] = (veh, s_val)
+                        if ghost.fixed_id in self.active_vehicles:
+                            del self.active_vehicles[ghost.fixed_id]
+                    else:
+                        survivors.append((veh, s_val))
+
+            # 更新队列为去重后的 (vehicle, s) 列表
+            self.lane_queues[lane_id] = survivors
+
+            # ----- 推演每个车辆的 S（断联推演 or 在线追击）-----
+            for idx, (veh, s_val) in enumerate(survivors):
+                if veh.fixed_id not in current_radar_ids:
+                    # ==========================================
+                    # 1. 断联/离线状态：执行 IDM 盲区推演
+                    # ==========================================
+                    if veh.v < 1.0:
+                        veh.v = 2.0  # 可调整，建议保守值 1.0~2.0
+
+                    if idx == 0:
+                        # 头车：匀速
+                        new_s = s_val + veh.v * dt
+                    else:
+                        # 跟车：简单 IDM
+                        leader_veh, leader_s = survivors[idx - 1]
+                        dist = leader_s - s_val
+                        if dist < 15.0:
+                            veh.v = max(0, veh.v - 2.0 * dt)
+                        else:
+                            veh.v = leader_veh.v
+                        new_s = s_val + veh.v * dt
+
+                    # 更新车辆状态
+                    if not veh.is_off_lane:
+                        veh.s = new_s
+                        veh.target_s = new_s  # ✅ 断联推演时，两者保持同步
+                        # S 坐标往前推演了，必须同步更新 2D 物理坐标
+                        px, py = self.map_mgr.get_xy_from_s(veh.lane_id, new_s)
+                        if px is not None:
+                            veh.raw_x, veh.raw_y = px, py
+                    else:
+                        # ⚠️ 恢复原本的脱轨逻辑：离线且脱离车道时，仅记录推演 S
+                        veh.last_s = new_s
+
+                    print(f'idm: {int(veh.fixed_id)%10000}-{idx}')
+
+                else:
+                    # ==========================================
+                    # 2. 在线/观测状态：正常更新 或 执行推演车追击
+                    # ==========================================
+                    if getattr(veh, 'is_chasing', False):
+                        # ===== 核心：推演车追击真实车逻辑 =====
+                        gap = veh.target_s - veh.s
+
+                        # 如果物理偏差离谱(>30米)，说明 IDM 推演出大错，放弃追击直接瞬移
+                        if abs(gap) > 30.0:
+                            veh.s = veh.target_s
+                            veh.is_chasing = False
+                        else:
+                            catch_speed = 4.0  # 追击速度差：比真实车快/慢 6m/s
+
+                            if gap > 0:
+                                # 推演车在真实车后方，加速追赶
+                                veh.s += (veh.v + catch_speed) * dt
+                                if veh.s >= veh.target_s:
+                                    veh.s = veh.target_s
+                                    veh.is_chasing = False
+                            else:
+                                # 🚀 修改点：推演车冲过头了，强制原地等待真实车，绝对不后退！
+                                # 这里不再对 veh.s 做任何数学计算，相当于视觉画面刹停
+                                if veh.s <= veh.target_s:  # 一旦真实的雷达位置开上来超过了当前推演位置
+                                    veh.s = veh.target_s
+                                    veh.is_chasing = False
+                    print(f'idm: {int(veh.fixed_id)%10000}-{idx}')
+        self.last_update_time = current_time
+
+    def _generate_processed_vehicles(self, current_time):
+        res = []
+        for veh in self.active_vehicles.values():
+            if (current_time - veh.first_seen_time) < 300:
+                continue
+
+            # ✅ 新增：如果是推演追击状态，强行保持 is_predicted = True 通知前端
+            is_predicted_flag = (current_time - veh.last_radar_time > 500) or getattr(veh, 'is_chasing', False)
+
+            if veh.is_off_lane:
+                # 已经脱离车道，放弃 S 坐标约束，直接使用自带滤波的 2D 物理坐标
+                x, y = veh.raw_x, veh.raw_y
+                # 航向使用原始航向（或车道方向，可由业务决定）
+                heading_rad = math.radians(veh.raw_heading)
+                output_radar_heading = veh.raw_heading
+            else:
+                x, y = self.map_mgr.get_xy_from_s(veh.lane_id, veh.s)
+                map_heading = self.map_mgr.lanes[veh.lane_id]['heading']
+                geo_heading = (90 - map_heading) % 360
+                is_predicted = (current_time - veh.last_radar_time > 100)
+
+                # ==========================================
+                # 🚀 状态机消费：海一路逆行方向保持
+                # ==========================================
+                haiyi_lanes = {'137438953490', '137438953506'}
+                if veh.lane_id in haiyi_lanes and getattr(veh, 'is_reverse_driving', False):
+                    # 借道超车状态下，将基础航向强制翻转180度
+                    geo_heading = (geo_heading + 180) % 360
+                else:
+                    # 保留原有的雷达反向感知/倒车兼容处理
+                    angle_diff = abs((geo_heading - veh.raw_heading + 180) % 360 - 180)
+                    if angle_diff > 150 and not is_predicted and (veh.lane_id != '137438953490'):
+                        geo_heading = (geo_heading + 180) % 360
+                        print(f'angle reverse : {int(veh.fixed_id)%10000}')
+
+                # ==========================================
+                # 🛡️ 新增：最终防线 (基于 S 坐标增减的物理事实强制覆写)
+                # ==========================================
+                # 只有当车辆有明显的物理位移时 (速度 > 0.5m/s，屏蔽静止噪点)，才触发绝对覆写
+                signed_v = getattr(veh, 'signed_v', 0.0)
+                base_map_geo = (90 - map_heading) % 360
+
+                if signed_v > 0.5:
+                    # S 增加：说明沿着车道线正向开
+                    geo_heading = base_map_geo
+                elif signed_v < -0.5:
+                    # S 减小：说明逆着车道线反向开 (倒车/借道逆行)
+                    geo_heading = (base_map_geo + 180) % 360
+
+                # ==========================================
+                # 🚀 新增：注入平滑变道曲线与航向角插值
+                # ==========================================
+                if getattr(veh, 'is_changing_lane', False):
+                    elapsed = current_time - veh.lc_start_time
+                    if elapsed < veh.lc_duration:
+                        # 核心数学：Cosine ease-in-out 函数，实现 (1.0 -> 0.0) 的丝滑过渡衰减
+                        ratio = 0.5 * (1 + math.cos(math.pi * elapsed / veh.lc_duration))
+
+                        x += veh.lc_offset_x * ratio
+                        y += veh.lc_offset_y * ratio
+                        geo_heading += veh.lc_offset_heading * ratio
+                    else:
+                        veh.is_changing_lane = False  # 动画自然结束，完全贴合新车道
+
+                # 更新修正后的航向角
+                geo_heading = geo_heading % 360
+                heading_rad = math.radians(geo_heading)
+                output_radar_heading = geo_heading
+                # ==========================================
+
+                if not veh.is_off_lane:
+                    # 🚀 在轨车辆应用输出级平滑滤波。传递 is_lc 参数防止动画期间触发 3m 的硬切保护！
+                    is_animating = getattr(veh, 'is_changing_lane', False)
+                    x, y = self._alpha_filter_xy(veh, x, y, is_lc=is_animating)
+
+            # === [新增]：无论离线还是在轨，缓存最后用于前端渲染的视角航向 ===
+            veh.out_heading = output_radar_heading
+
+            res.append(ProcessedVehicle(
+                original_id=veh.fixed_id,
+                fixed_id=veh.fixed_id,
+                x=x, y=y, v=veh.v,
+                psi=heading_rad,
+                is_predicted=is_predicted_flag,
+                radar_heading=output_radar_heading,
+                **veh.attrs
+            ))
+        return res
+
+    @staticmethod
+    def _alpha_filter_xy(veh: VehicleState, x, y, alpha=0.2, is_lc=False):
+        """
+        引入滤波平滑输出
+        对(x,y) 进行滤波，使前端轨迹更平滑，同时避免位置突变。
+        alpha = 0.3 意味着 30% 信任新算出的目标位置，70% 保持原有轨迹的惯性
+        """
+        if veh.out_x is None or veh.out_y is None:
+            # 第一次输出，直接赋值
+            veh.out_x = x
+            veh.out_y = y
+        else:
+            # 计算期望目标坐标与当前平滑坐标的几何距离
+            dist_jump = math.hypot(x - veh.out_x, y - veh.out_y)
+
+            # ✅ 新增：如果正在播放变道动画(is_lc=True)，绝对禁止触发硬切拉扯机制！
+            if dist_jump > 3.0 and not is_lc:
+                # 【防拉扯机制】：如果突变超过 3 米（如 3 帧确认后瞬间切入新车道）
+                # 直接重置平滑坐标，强行硬切。防止前端画面出现车辆在马路上横向“滑移”漂过去的假象！
+                veh.out_x = x
+                veh.out_y = y
+            else:
+                # 【常规平滑机制】：一阶低通滤波 (Alpha 稳态卡尔曼近似)
+                veh.out_x = veh.out_x * (1 - alpha) + x * alpha
+                veh.out_y = veh.out_y * (1 - alpha) + y * alpha
+
+        return veh.out_x, veh.out_y
+
+    def _update_off_lane_vehicle(self, fixed_id, rv, attrs, current_time):
+        if fixed_id in self.active_vehicles:
+            veh = self.active_vehicles[fixed_id]
+            if not veh.is_off_lane:
+                # 转入离线，保存最后车道信息
+                veh.last_lane_id = veh.lane_id
+                veh.last_s = veh.s
+                veh.is_off_lane = True
+                veh.lane_id = None
+                # 可重置输出平滑缓存，避免突变
+                veh.out_x = veh.out_y = None
+                veh.is_changing_lane = False  # ✅ 新增：离线时强制打断变道动画
+            # 更新原始坐标（用于重入匹配）
+            alpha = 0.1
+            veh.raw_x = veh.raw_x * (1 - alpha) + rv.rel_x * alpha
+            veh.raw_y = veh.raw_y * (1 - alpha) + rv.rel_y * alpha
+            veh.raw_heading = rv.radar_heading
+            veh.last_radar_time = current_time
+            veh.attrs = attrs
+        else:
+            # 新建离线车辆（没有车道信息）
+            new_veh = VehicleState(
+                fixed_id, None, 0, 0, 0, attrs, current_time,
+                rv.rel_x, rv.rel_y, rv.radar_heading
+            )
+            new_veh.is_off_lane = True
+            new_veh.last_lane_id = None
+            self.active_vehicles[fixed_id] = new_veh
+
+    def _cleanup_stale_vehicles(self, current_time, timeout=2500):
+        """清理长时间未收到雷达信号的车辆 (默认 10 秒)"""
+        expired_ids = [
+            v_id for v_id, veh in self.active_vehicles.items()
+            if (current_time - veh.last_radar_time) > timeout
+        ]
+        for v_id in expired_ids:
+            del self.active_vehicles[v_id]

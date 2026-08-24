@@ -1,0 +1,80 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="nvidia-pyindex" />
+          <option value="nvidia-dali" />
+          <option value="tfrecord" />
+          <option value="matplotlib" />
+          <option value="tqdm" />
+          <option value="pytorch-lightning" />
+          <option value="hydra-core" />
+          <option value="h5py" />
+          <option value="Markdown" />
+          <option value="numpy" />
+          <option value="numpy-quaternion" />
+          <option value="opencv-python" />
+          <option value="pandas" />
+          <option value="Pillow" />
+          <option value="protobuf" />
+          <option value="pyparsing" />
+          <option value="scikit-learn" />
+          <option value="scipy" />
+          <option value="six" />
+          <option value="sklearn" />
+          <option value="tensorboard" />
+          <option value="tensorboard-data-server" />
+          <option value="tensorboard-plugin-wit" />
+          <option value="tensorboardX" />
+          <option value="torch" />
+          <option value="torch-cluster" />
+          <option value="torch-geometric" />
+          <option value="torch-scatter" />
+          <option value="torch-sparse" />
+          <option value="torch-spline-conv" />
+          <option value="torchaudio" />
+          <option value="torchvision" />
+          <option value="comfyui-frontend-package" />
+          <option value="comfyui-workflow-templates" />
+          <option value="comfyui-embedded-docs" />
+          <option value="torchsde" />
+          <option value="einops" />
+          <option value="transformers" />
+          <option value="tokenizers" />
+          <option value="sentencepiece" />
+          <option value="safetensors" />
+          <option value="aiohttp" />
+          <option value="yarl" />
+          <option value="pyyaml" />
+          <option value="psutil" />
+          <option value="alembic" />
+          <option value="SQLAlchemy" />
+          <option value="av" />
+          <option value="comfy-kitchen" />
+          <option value="kornia" />
+          <option value="spandrel" />
+          <option value="pydantic" />
+          <option value="pydantic-settings" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyPep8NamingInspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="ignoredErrors">
+        <list>
+          <option value="N806" />
+          <option value="N803" />
+          <option value="N802" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="matplotlib.axes._axes.Axes.*" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

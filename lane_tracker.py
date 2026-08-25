@@ -597,6 +597,20 @@ class LaneQueueTracker:
 
         return best_id
 
+    # 🚀 固定设施类子类集合：这些目标位置固定不动，不参与 2D 去重，防止被误杀
+    # 舱盖板=13, 候工亭=16, 锁销框=17
+    DEDUP_EXEMPT_SUB_TYPES = {13, 16, 17}
+
+    @classmethod
+    def _is_dedup_exempt(cls, veh):
+        """
+        🚀 2D 去重豁免判定：
+        舱盖板(13)、候工亭(16)、锁销框(17) 这三类固定设施，
+        因位置恒定、不会分裂移动，一律不参与 2D 去重仲裁，
+        防止被其他目标去重误杀（对应现象：后台有检测结果，但平台上没有）。
+        """
+        return veh.attrs.get("itc_sub_type", 99) in cls.DEDUP_EXEMPT_SUB_TYPES
+
     def _update_physics_queues(self, current_time, current_radar_ids):
         # 初始化时间步长
         if self.last_update_time is None:
@@ -618,6 +632,11 @@ class LaneQueueTracker:
 
                 # 如果其中一个已经被标记为待删幽灵，则跳过
                 if v1.fixed_id in off_lane_to_delete or v2.fixed_id in off_lane_to_delete:
+                    continue
+
+                # 🚀 固定设施去重豁免：只要任意一方是舱盖板(13)/候工亭(16)/锁销框(17)，
+                # 本对目标不参与 2D 去重，防止固定目标被误杀
+                if self._is_dedup_exempt(v1) or self._is_dedup_exempt(v2):
                     continue
 
                 # 计算两个游离目标的 2D 物理距离
@@ -685,7 +704,12 @@ class LaneQueueTracker:
                     survivors.append((veh, s_val))
                 else:
                     leader_veh, leader_s = survivors[-1]
-                    if (leader_s - s_val) < 15.0 and abs(leader_veh.v - veh.v) < 3.0:
+
+                    # 🚀 固定设施去重豁免：只要任意一方是舱盖板(13)/候工亭(16)/锁销框(17)，
+                    # 本对目标不参与同车道去重合并，防止固定目标被误杀
+                    if self._is_dedup_exempt(leader_veh) or self._is_dedup_exempt(veh):
+                        survivors.append((veh, s_val))
+                    elif (leader_s - s_val) < 15.0 and abs(leader_veh.v - veh.v) < 3.0:
                         # 仲裁：谁拥有更近的真实雷达点，谁才是真身！
                         if leader_veh.last_radar_time >= veh.last_radar_time:
                             ghost = veh  # 丢弃落后的/旧的

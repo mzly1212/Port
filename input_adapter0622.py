@@ -64,13 +64,9 @@ class NebulaInputAdapter:
         # 遍历感知目标列表
         for target in msg.perceptron:
             # ==========================================
-            # 1. 基础过滤：放行机动车(1)和未知物体(0)
-            # 很多时候雷达认不出卡车，会标为 0(未知)，绝不能直接丢弃，要靠后续尺寸反推！
-            # 仅过滤明确的非机动车(2)和行人(3)
+            # 0 是未 知，1 是机动车，2 是 机动车，3 是行人，4 是 rsu 自身
             # ==========================================
-            obj_class = getattr(target, 'object_class_type', 0)
-            # if obj_class in (2, 3):
-            #     continue
+            obj_type_itc = getattr(target, 'object_class_type', 0)
 
             lon = target.point_gps.object_longitude
             lat = target.point_gps.object_latitude
@@ -88,7 +84,6 @@ class NebulaInputAdapter:
             # ==========================================
             ttype = getattr(target, 'ptc_Exttype', 0)
 
-            obj_type_itc = 1  # 默认父类：1 (车)
             sub_type_itc = 99  # 默认(未知)
 
             if ttype == 1:

@@ -23,7 +23,7 @@ class Config:
     RECT_LON_MIN, RECT_LON_MAX = 113.86348, 113.86550
     RECT_LAT_MIN, RECT_LAT_MAX = 22.49311, 22.49806
 
-    AI_ENABLED = True
+
 
     # ===== 车辆控制与动画配置 =====
     VEHICLE_L = 6.0

@@ -598,8 +598,8 @@ class LaneQueueTracker:
         return best_id
 
     # 🚀 固定设施类子类集合：这些目标位置固定不动，不参与 2D 去重，防止被误杀
-    # 舱盖板=13, 候工亭=16, 锁销框=17
-    DEDUP_EXEMPT_SUB_TYPES = {13, 16, 17}
+    # 舱盖板=13, 候工亭/锁销框=16
+    DEDUP_EXEMPT_SUB_TYPES = {13, 16}
 
     @classmethod
     def _is_dedup_exempt(cls, veh):

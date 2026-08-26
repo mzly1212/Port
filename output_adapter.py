@@ -1,6 +1,5 @@
 import struct
 import math
-from datetime import datetime, timedelta
 import pandas as pd
 from data import ProcessedFrame
 from config import Config
@@ -94,8 +93,12 @@ class ProtocolAdapter:
             truck_no_bytes = v.plate_num.encode('gbk', errors='ignore')[:20].ljust(20, b'\x00')
             body_bytes.extend(truck_no_bytes)
 
+            if v.itc_sub_type in {13, 14}:
+                heading = 160.0
+            else:
+                heading = degree
             # 经度(8), 纬度(8), 航向角(8), 拖挂航向(8), 速度(8) (全是 Double)
-            body_bytes.extend(struct.pack('<ddddd', lon, lat, degree, 0.0, speed_kmh))
+            body_bytes.extend(struct.pack('<ddddd', lon, lat, heading, 0.0, speed_kmh))
 
             # 信息类型(1 byte)
             body_bytes.extend(struct.pack('B', 0))  # 0:默认

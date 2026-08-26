@@ -598,14 +598,15 @@ class LaneQueueTracker:
         return best_id
 
     # 🚀 固定设施类子类集合：这些目标位置固定不动，不参与 2D 去重，防止被误杀
-    # 舱盖板=13, 候工亭/锁销框=16
-    DEDUP_EXEMPT_SUB_TYPES = {13, 16}
+    # itc_sub_type
+    # 舱盖板=14, 候工亭/锁销框=13
+    DEDUP_EXEMPT_SUB_TYPES = {13, 14}
 
     @classmethod
     def _is_dedup_exempt(cls, veh):
         """
-        🚀 2D 去重豁免判定：
-        舱盖板(13)、候工亭(16)、锁销框(17) 这三类固定设施，
+        🚀 2D 去重豁免判定： itc_sub_type
+        舱盖板(14)、候工亭/锁销框(13) 这三类固定设施，
         因位置恒定、不会分裂移动，一律不参与 2D 去重仲裁，
         防止被其他目标去重误杀（对应现象：后台有检测结果，但平台上没有）。
         """
@@ -634,7 +635,7 @@ class LaneQueueTracker:
                 if v1.fixed_id in off_lane_to_delete or v2.fixed_id in off_lane_to_delete:
                     continue
 
-                # 🚀 固定设施去重豁免：只要任意一方是舱盖板(13)/候工亭(16)/锁销框(17)，
+                # 🚀 固定设施去重豁免：只要任意一方是舱盖板(14),候工亭/锁销框(13)，
                 # 本对目标不参与 2D 去重，防止固定目标被误杀
                 if self._is_dedup_exempt(v1) or self._is_dedup_exempt(v2):
                     continue

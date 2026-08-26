@@ -118,6 +118,8 @@ class NebulaInputAdapter:
                 sub_type_itc = 99
             elif ttype == 16:
                 sub_type_itc = 13
+            else:
+                print(f'Unknown ptc_Exttype: {ttype}')
 
                 # 提取雷达原生方向角
             radar_heading = getattr(target, 'object_heading', 0.0) # 东0°, 北90°

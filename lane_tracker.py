@@ -6,6 +6,22 @@ from config import Config
 import numpy as np
 from shapely.geometry import Point
 
+# ==========================================
+# 🚀 固定设施类子类型：舱盖板(14)、候工亭/锁销框(13)
+# 这类目标物理位置恒定不动，执行"限移三重保护"策略：
+#   1. 去重豁免 —— 不参与 2D 去重仲裁，防止被误杀
+#   2. 身份隔离 —— 不与车辆互相缝合 ID，防止误绑定后跟随车辆移动
+#   3. 位置锚定 —— 坐标钉死在锚点附近，消除传感器波动导致的抖动
+# ==========================================
+FIXED_FACILITY_SUB_TYPES = {13, 14}
+
+# 固定设施锚定参数
+FACILITY_ANCHOR_SAMPLES = 10     # 锚点确认采样帧数 (10Hz 下约 1 秒)
+FACILITY_JITTER_DEADZONE = 0.5   # 抖动静区：偏移 <= 0.5m 视为传感器波动，坐标钉死在锚点
+FACILITY_MAX_DRIFT = 3.0         # 误绑定阈值：偏移 > 3.0m 判定为车辆误绑定，拒绝移动
+FACILITY_REANCHOR_MS = 15000     # 持续大幅偏移超过 15 秒才重新锚定 (兼容舱盖板被吊装搬运)
+FACILITY_TIMEOUT_MS = 10000      # 固定设施断检存活期 (防止过车遮挡导致平台图标闪烁)
+
 
 class VehicleState:
     def __init__(self, obj_id, lane_id, s, l_offset, v, attrs, current_time, rel_x, rel_y, raw_heading):
@@ -61,8 +77,23 @@ class VehicleState:
         self.is_reverse_driving = False  # 是否处于逆行借道状态
         self.signed_v = 0.0  # ✅ 新增：记录带有方向的真实 S 轴速度
 
+        # ===== 新增：固定设施位置锚定 =====
+        self.anchor_x = None               # 锚点坐标 (确认期结束后锁定)
+        self.anchor_y = None
+        self.anchor_obs = deque(maxlen=FACILITY_ANCHOR_SAMPLES)  # 确认期观测采样 (中位数免疫误绑定尖峰)
+        self.drift_since = None            # 持续大幅偏移的起始时间 (用于真实搬运后重新锚定)
+
     def update_s_and_chase(self, current_time, raw_s):
         """处理真实坐标更新，并触发/维持推演车追击状态"""
+        # 🚀 固定设施：纵向位置直接采用锚定坐标的车道投影结果，
+        # 不参与棘轮/追击/测速 (设施速度恒为 0，杜绝一切纵向移动来源)
+        if self.attrs.get("itc_sub_type", 99) in FIXED_FACILITY_SUB_TYPES:
+            self.v = 0.0
+            self.signed_v = 0.0
+            self.target_s = raw_s
+            self.s = raw_s
+            return
+
         # 1. 速度估算永远依赖【真实雷达点】，将抗噪任务全权交给后续的最小二乘法 (允许轻微噪点回退)
         self.v = self.update_and_estimate_speed(current_time, raw_s)
         self.target_s = raw_s  # 物理层永远保持为真实的雷达纵向坐标
@@ -106,14 +137,71 @@ class VehicleState:
     # ==========================================
     # �� 新增：原始坐标前置滤波方法
     # ==========================================
-    def update_raw_xy(self, new_x, new_y):
+    def update_raw_xy(self, new_x, new_y, current_time=None):
         """
         在送入地图匹配前，对二维物理坐标进行预平滑。
         不仅能消除雷达高频抖动，更能让 match_to_lane 的评分与横向距离计算更加稳健。
         """
+        # 🚀 固定设施：走"位置锚定"策略 —— 限制移动、消除抖动
+        if self.attrs.get("itc_sub_type", 99) in FIXED_FACILITY_SUB_TYPES:
+            return self._update_fixed_facility_xy(new_x, new_y, current_time)
+
         alpha = 0.3  # 30% 信任新雷达点，70% 沿用上一帧物理惯性
         self.raw_x = self.raw_x * (1 - alpha) + new_x * alpha
         self.raw_y = self.raw_y * (1 - alpha) + new_y * alpha
+        return self.raw_x, self.raw_y
+
+    def _update_fixed_facility_xy(self, new_x, new_y, current_time=None):
+        """
+        🚀 固定设施位置锚定策略 (限制移动 + 消除抖动)：
+        - 确认期 (前 FACILITY_ANCHOR_SAMPLES 帧)：采样观测取中位数锁定锚点，
+          中位数天然免疫确认期内偶发的误绑定尖峰
+        - 锚定期：
+            偏移 <= 0.5m      -> 传感器波动，坐标钉死在锚点 (彻底消除抖动)
+            0.5m < 偏移 <= 3m -> 重滤波缓慢收敛 (纠正锚点小偏差，视觉上近似静止)
+            偏移 > 3m         -> 判定为过车误绑定，拒绝该观测、位置保持不动；
+                                 持续超过 15 秒才重新锚定 (兼容舱盖板被吊装搬运的真实场景)
+        """
+        # ---- 阶段 1：锚点确认期 ----
+        if self.anchor_x is None:
+            self.anchor_obs.append((new_x, new_y))
+            # 确认期内先用常规轻滤波，保证有连续输出
+            alpha = 0.3
+            self.raw_x = self.raw_x * (1 - alpha) + new_x * alpha
+            self.raw_y = self.raw_y * (1 - alpha) + new_y * alpha
+            if len(self.anchor_obs) >= self.anchor_obs.maxlen:
+                xs = [p[0] for p in self.anchor_obs]
+                ys = [p[1] for p in self.anchor_obs]
+                self.anchor_x = float(np.median(xs))
+                self.anchor_y = float(np.median(ys))
+                self.raw_x, self.raw_y = self.anchor_x, self.anchor_y
+            return self.raw_x, self.raw_y
+
+        # ---- 阶段 2：锚定期 ----
+        drift = math.hypot(new_x - self.anchor_x, new_y - self.anchor_y)
+
+        if drift <= FACILITY_JITTER_DEADZONE:
+            # 传感器小波动：完全忽略，钉死在锚点
+            self.drift_since = None
+            self.raw_x, self.raw_y = self.anchor_x, self.anchor_y
+        elif drift <= FACILITY_MAX_DRIFT:
+            # 中等偏移：重滤波缓慢收敛 (alpha 极小，视觉上近似静止)
+            self.drift_since = None
+            alpha = 0.05
+            self.raw_x = self.raw_x * (1 - alpha) + new_x * alpha
+            self.raw_y = self.raw_y * (1 - alpha) + new_y * alpha
+        else:
+            # 大幅偏移：大概率是过车误绑定，拒绝该观测，位置保持不动
+            if current_time is not None:
+                if self.drift_since is None:
+                    self.drift_since = current_time
+                elif current_time - self.drift_since >= FACILITY_REANCHOR_MS:
+                    # 持续大幅偏移超过 15 秒：判定为真实搬运 (如舱盖板被吊走)，重新锚定
+                    self.anchor_x, self.anchor_y = new_x, new_y
+                    self.raw_x, self.raw_y = new_x, new_y
+                    self.drift_since = None
+                    print(f'[固定设施重新锚定] ID:{int(self.fixed_id) % 10000} -> ({new_x:.2f}, {new_y:.2f})')
+
         return self.raw_x, self.raw_y
 
     # ==========================================
@@ -125,6 +213,10 @@ class VehicleState:
         避免在 0° 和 360° 交界处滤波时发生 180° 甩头异变。
         """
         alpha = 0.2  # 滤波系数：30% 信任新航向，70% 保持惯性
+
+        # 🚀 固定设施：航向恒定，用更重的滤波彻底抑制图标旋转抖动
+        if self.attrs.get("itc_sub_type", 99) in FIXED_FACILITY_SUB_TYPES:
+            alpha = 0.05
 
         # 1. 计算两角之间的最短几何路径差 (-180° ~ 180°)
         # 例如：old = 350, new = 10 -> diff = (10 - 350 + 180)%360 - 180 = +20
@@ -209,6 +301,19 @@ class LaneQueueTracker:
 
             old_veh = self.active_vehicles.get(fixed_id)
 
+            # ==========================================
+            # 🚀 固定设施身份防劫持：
+            # 设备偶发把固定设施的检测点错绑到某辆车的 ID 上。
+            # 若历史状态是已确认车辆(非未知)、新点却是设施(13/14)，必为误绑定：
+            # 直接丢弃该点，保护车辆轨迹不被设施位置污染。
+            # (反向"车辆点错绑到设施ID"由位置锚定机制冻结，无需丢弃)
+            # ==========================================
+            if old_veh is not None:
+                _old_sub = old_veh.attrs.get("itc_sub_type", 99)
+                if rv.itc_sub_type in FIXED_FACILITY_SUB_TYPES \
+                        and _old_sub not in FIXED_FACILITY_SUB_TYPES and _old_sub != 99:
+                    continue
+
             veh_v = old_veh.v if old_veh else 0.0
             last_lane = old_veh.lane_id if old_veh else None
 
@@ -229,7 +334,7 @@ class LaneQueueTracker:
 
             if old_veh:
                 # 针对追踪到的老车，同时对 2D 坐标和 360° 航向角执行滤波
-                match_x, match_y = old_veh.update_raw_xy(rv.rel_x, rv.rel_y)
+                match_x, match_y = old_veh.update_raw_xy(rv.rel_x, rv.rel_y, current_time)
                 match_heading = old_veh.update_raw_heading(input_heading)
             else:
                 # 新车首帧无历史惯性，直接沿用原值
@@ -301,7 +406,8 @@ class LaneQueueTracker:
             # 全域 2D 物理缝合 (解决换道残留)
             # ==========================================     T路口不匹配
             if fixed_id not in self.active_vehicles and not self.map_mgr.zone_mgr.is_in_zone(match_x, match_y, 'AREA_T'):
-                matched_id = self._find_best_match_2d(match_x, match_y, rv.radar_heading, current_time)
+                matched_id = self._find_best_match_2d(match_x, match_y, rv.radar_heading, current_time,
+                                                      incoming_sub_type=rv.itc_sub_type)
                 if matched_id:
                     fixed_id = matched_id
 
@@ -547,7 +653,7 @@ class LaneQueueTracker:
         # �� 必须同时返回 仲裁车道 和 劫持航向角
         return  forced_haiyi_lane, hijacked_heading
 
-    def _find_best_match_2d(self, rel_x, rel_y, rv_heading, current_time):
+    def _find_best_match_2d(self, rel_x, rel_y, rv_heading, current_time, incoming_sub_type=99):
         """
         �� 全域 2D 物理缝合（融合版）：
         1. 严格保留原版“极近距离瞬间分裂噪点”的消除机制
@@ -561,6 +667,20 @@ class LaneQueueTracker:
             dist = math.hypot(veh.raw_x - rel_x, veh.raw_y - rel_y)
             time_diff = current_time - veh.last_radar_time
             dt_sec = max(time_diff / 1000.0, 0.1)
+
+            # ==========================================
+            # 🚀 固定设施身份隔离防线：
+            # 1. 车辆点绝不认领固定设施的 ID (防止误绑定后设施跟随车辆移动)
+            # 2. 固定设施点绝不认领车辆的 ID (防止设施瞬移进车流、污染车辆轨迹)
+            # 3. 仅"未知类型(99)且距离 <= 5m"的点允许缝合设施
+            #    (兼容设备偶发把设施上报为未知类型的 ID 跳变重连)
+            # ==========================================
+            if self._is_fixed_facility(veh):
+                if incoming_sub_type not in FIXED_FACILITY_SUB_TYPES:
+                    if not (incoming_sub_type == 99 and dist <= 5.0):
+                        continue
+            elif incoming_sub_type in FIXED_FACILITY_SUB_TYPES:
+                continue
 
             # ==========================================
             # ��️ 隔离防线：海一路专属 - 运动学方向一票否决
@@ -598,19 +718,26 @@ class LaneQueueTracker:
         return best_id
 
     # 🚀 固定设施类子类集合：这些目标位置固定不动，不参与 2D 去重，防止被误杀
-    # itc_sub_type
-    # 舱盖板=14, 候工亭/锁销框=13
-    DEDUP_EXEMPT_SUB_TYPES = {13, 14}
+    # itc_sub_type: 舱盖板=14, 候工亭/锁销框=13
+    DEDUP_EXEMPT_SUB_TYPES = FIXED_FACILITY_SUB_TYPES
+
+    @classmethod
+    def _is_fixed_facility(cls, veh):
+        """
+        🚀 固定设施判定：舱盖板(14)、候工亭/锁销框(13)。
+        这类目标物理位置恒定，全程享受"限移三重保护"：
+        去重豁免 / 身份隔离 / 位置锚定。
+        """
+        return veh.attrs.get("itc_sub_type", 99) in FIXED_FACILITY_SUB_TYPES
 
     @classmethod
     def _is_dedup_exempt(cls, veh):
         """
-        🚀 2D 去重豁免判定： itc_sub_type
-        舱盖板(14)、候工亭/锁销框(13) 这三类固定设施，
+        🚀 2D 去重豁免判定：固定设施(舱盖板(14)、候工亭/锁销框(13))
         因位置恒定、不会分裂移动，一律不参与 2D 去重仲裁，
         防止被其他目标去重误杀（对应现象：后台有检测结果，但平台上没有）。
         """
-        return veh.attrs.get("itc_sub_type", 99) in cls.DEDUP_EXEMPT_SUB_TYPES
+        return cls._is_fixed_facility(veh)
 
     def _update_physics_queues(self, current_time, current_radar_ids):
         # 初始化时间步长
@@ -706,7 +833,7 @@ class LaneQueueTracker:
                 else:
                     leader_veh, leader_s = survivors[-1]
 
-                    # 🚀 固定设施去重豁免：只要任意一方是舱盖板(13)/候工亭(16)/锁销框(17)，
+                    # 🚀 固定设施去重豁免：只要任意一方是舱盖板(14)/候工亭/锁销框(13)，
                     # 本对目标不参与同车道去重合并，防止固定目标被误杀
                     if self._is_dedup_exempt(leader_veh) or self._is_dedup_exempt(veh):
                         survivors.append((veh, s_val))
@@ -737,6 +864,13 @@ class LaneQueueTracker:
             # ----- 推演每个车辆的 S（断联推演 or 在线追击）-----
             for idx, (veh, s_val) in enumerate(survivors):
                 if veh.fixed_id not in current_radar_ids:
+                    # ==========================================
+                    # 🚀 固定设施：位置恒定，绝不参与 IDM 盲区推演
+                    # (防止断检期间被"推演着走"，速度被虚增至 2m/s)
+                    # ==========================================
+                    if self._is_fixed_facility(veh):
+                        continue
+
                     # ==========================================
                     # 1. 断联/离线状态：执行 IDM 盲区推演
                     # ==========================================
@@ -965,6 +1099,13 @@ class LaneQueueTracker:
         expired_ids = []
         for v_id, veh in self.active_vehicles.items():
             time_silent = current_time - veh.last_radar_time
+
+            # 🚀 固定设施：位置恒定，延长存活期至 FACILITY_TIMEOUT_MS (10秒)
+            # (防止被过车短暂遮挡导致平台图标闪烁：后台有、平台上没有)
+            if self._is_fixed_facility(veh):
+                if time_silent > FACILITY_TIMEOUT_MS:
+                    expired_ids.append(v_id)
+                continue
 
             if veh.is_off_lane or veh.lane_id is None:
                 # 游离状态：严格执行 2 秒快杀

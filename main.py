@@ -19,6 +19,11 @@ logging.basicConfig(level=logging.INFO,
                     handlers=[handler, logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
+
+"""
+aaaaaa
+"""
+
 def main():
     logger.info("初始化组件中...")
     engine = PerceptionFilterEngine(Config, use_ai=True)

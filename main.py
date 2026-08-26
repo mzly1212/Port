@@ -5,7 +5,7 @@ import socket
 import json
 from config import Config
 from smooth_engine import PerceptionFilterEngine
-from input_adapter0622 import NebulaInputAdapter
+from input_adapter import NebulaInputAdapter
 from output_adapter import ProtocolAdapter
 
 # --- 配置生产级日志 ---

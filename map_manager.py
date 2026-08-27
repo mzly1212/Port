@@ -134,6 +134,41 @@ class MapManager:
 
         return dist if cross_product >= 0 else -dist
 
+    def offset_lateral(self, lane_id, s, l):
+        """
+        已知车道、纵向距离 s 与带符号横向偏移 l(左正右负)，反推真实物理坐标。
+        与 get_signed_offset 的符号定义严格一致，互为逆运算：
+        车道切向逆时针旋转 90° 即"左侧"法线方向。
+        """
+        if lane_id not in self.lanes:
+            return None, None
+        line = self.lanes[lane_id]['line']
+        if line.length == 0:
+            return None, None
+
+        s = max(0.0, min(line.length, s))
+        p_line = line.interpolate(s)
+
+        # 构造车道切向矢量 (取样方式与 get_signed_offset 保持一致)
+        epsilon = min(1.0, line.length / 2.0)
+        if s + epsilon <= line.length:
+            p_ahead = line.interpolate(s + epsilon)
+            dx_line = p_ahead.x - p_line.x
+            dy_line = p_ahead.y - p_line.y
+        else:
+            p_behind = line.interpolate(s - epsilon)
+            dx_line = p_line.x - p_behind.x
+            dy_line = p_line.y - p_behind.y
+
+        norm = math.hypot(dx_line, dy_line)
+        if norm < 1e-9:
+            return p_line.x, p_line.y
+
+        # 左侧单位法线 (与 get_signed_offset 的"左正右负"定义互逆)
+        nx = -dy_line / norm
+        ny = dx_line / norm
+        return p_line.x + nx * l, p_line.y + ny * l
+
     def match_to_lane(self, x, y, veh_heading=None, v=0.0, last_lane_id=None, base_max_dist=3.0, forced_lane=None):
         """
         强化版核心映射：带有动态阈值、航向约束和历史粘滞的综合评分系统

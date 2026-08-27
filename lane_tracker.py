@@ -22,6 +22,30 @@ FACILITY_MAX_DRIFT = 3.0         # 误绑定阈值：偏移 > 3.0m 判定为车�
 FACILITY_REANCHOR_MS = 15000     # 持续大幅偏移超过 15 秒才重新锚定 (兼容舱盖板被吊装搬运)
 FACILITY_TIMEOUT_MS = 10000      # 固定设施断检存活期 (防止过车遮挡导致平台图标闪烁)
 
+# ==========================================
+# 🚗 行驶方向滞回状态机参数 (根治车头 180° 来回翻转)
+#   旧策略直接用最小二乘回归斜率 signed_v 的正负翻转航向角,
+#   低速/雷达噪声下斜率在阈值附近抖动, 导致车头前后甩动。
+#   新策略: 死区 + 连续确认的滞回状态机, 只有持续显著的反向
+#   物理证据才允许翻转一次方向。
+# ==========================================
+DIR_DEADZONE = 0.8    # 死区: |signed_v| < 0.8 m/s 视为噪声, 不参与方向判定
+DIR_CONFIRM_N = 5     # 翻转方向需连续 5 个有效采样确认 (10Hz 下约 0.5 秒)
+
+# ==========================================
+# 🚗 车型投票锁定参数 (取代旧的"首次非99即永久锁定")
+#   旧策略第一帧误分类会被永久锁死。新策略按置信度加权投票:
+#   占比与帧数双门槛达标才锁定; 锁定后若出现压倒性反证仍可纠正;
+#   固定设施(13/14)额外要求"物理静止"证据, 防止行驶中的车辆被
+#   误锁成设施后触发位置锚定而"钉死"在原地。
+# ==========================================
+TYPE_DECAY = 0.98           # 票数时间衰减系数 (半衰期约 3.4 秒 @10Hz)
+TYPE_LOCK_RATIO = 0.6       # 普通类型锁定占比门槛
+TYPE_LOCK_FRAMES = 8        # 普通类型锁定最小观测帧数
+TYPE_FAC_LOCK_RATIO = 0.85  # 固定设施锁定占比门槛 (更严格)
+TYPE_FAC_LOCK_FRAMES = 10   # 固定设施锁定最小观测帧数
+TYPE_FIX_RATIO = 0.8        # 已锁定类型的纠正占比门槛 (反证占压倒性优势才纠正)
+
 
 class VehicleState:
     def __init__(self, obj_id, lane_id, s, l_offset, v, attrs, current_time, rel_x, rel_y, raw_heading):
@@ -77,6 +101,17 @@ class VehicleState:
         self.is_reverse_driving = False  # 是否处于逆行借道状态
         self.signed_v = 0.0  # ✅ 新增：记录带有方向的真实 S 轴速度
 
+        # ===== 新增：行驶方向滞回状态机 (根治车头 180° 翻转抖动) =====
+        self.drive_direction = 0    # 0=未知, 1=沿车道正向, -1=沿车道反向
+        self.dir_candidate = 0      # 候选方向 (等待连续确认)
+        self.dir_confirm = 0        # 候选方向连续确认计数
+
+        # ===== 新增：车型投票锁定状态 =====
+        self.type_votes = {}        # sub_type -> 加权票数 (按置信度加权, 随时间衰减)
+        self.type_obs_count = 0     # 有效观测帧数 (不含 99 未知)
+        self.locked_type = None     # 投票锁定后的子类型
+        self.locked_obj_type = None # 锁定时的父类型 (保证父子类型一致)
+
         # ===== 新增：固定设施位置锚定 =====
         self.anchor_x = None               # 锚点坐标 (确认期结束后锁定)
         self.anchor_y = None
@@ -111,26 +146,29 @@ class VehicleState:
                 # 常态防后退/防瞬移 (单向棘轮) 机制
                 # 彻底解决雷达噪点回跳导致的画面拉扯与视觉倒退问题
                 # ==========================================
-                if self.signed_v > 0.5:
+                if self.drive_direction > 0:
                     # 明确正向行驶中：不允许 S 减小。若雷达噪点回跳，停在原地等待真实信号跟上
-                    if self.target_s < self.s:
-                        pass
-                    else:
+                    # (改用方向状态机裁决而非瞬时 signed_v, 消除回归斜率抖动导致的棘轮方向反复反转)
+                    if self.target_s >= self.s:
                         self.s = self.target_s
-                elif self.signed_v < -0.5:
+                elif self.drive_direction < 0:
                     # 明确倒车/逆行中：不允许 S 增加。若雷达噪点前跳，停在原地等待
-                    if self.target_s > self.s:
-                        pass
-                    else:
+                    if self.target_s <= self.s:
                         self.s = self.target_s
                 else:
-                    # 车辆几乎静止：完全相信雷达并交给底层的 _alpha_filter_xy 2D平滑
+                    # 方向未确认：完全相信雷达并交给底层的 _alpha_filter_xy 2D平滑
                     # (防止单向机制导致静止车辆的坐标随噪点不断向前/向后累积蠕动)
                     self.s = self.target_s
 
     def update_l(self, raw_l):
-        """对横向偏移 L 进行一阶低通滤波"""
-        alpha = 0.2  # 滤波系数：越小越平滑，抗噪越强 (0.2 相当于极度信任历史)
+        """
+        对横向偏移 L 进行一阶低通滤波 (动态系数)：
+        - 偏差大 (> 0.6m, 变道/入轨修正中): alpha=0.5 快速跟随真实横移
+        - 偏差小 (正常巡航): alpha=0.2 极度平滑抗噪
+        旧的固定 alpha=0.2 会让变道时的横向偏移收敛滞后数秒。
+        """
+        err = abs(raw_l - self.filtered_l)
+        alpha = 0.5 if err > 0.6 else 0.2
         self.filtered_l = self.filtered_l * (1 - alpha) + raw_l * alpha
         return self.filtered_l
 
@@ -264,8 +302,116 @@ class VehicleState:
         # ✅ 记录 S 的真实变化率 (正代表沿车道，负代表逆车道)
         self.signed_v = slope
 
+        # ✅ 方向滞回状态机推进: 消除回归斜率噪声导致的车头 180° 来回翻转
+        self._update_drive_direction()
+
         # 物理极限制裁：防止算出离谱速度 (例如限制在 0m/s 到 +30m/s 之间)
         return max(0.0, min(30.0, slope))
+
+    def _update_drive_direction(self):
+        """
+        🚗 行驶方向滞回状态机 (0=未知, 1=正向, -1=反向)。
+        旧逻辑直接以 signed_v 正负(阈值0.5)翻转航向角, 低速或雷达噪声下
+        回归斜率会在阈值附近抖动, 造成车头 180° 来回甩动、单向棘轮反复反转。
+        新逻辑: 只有当 |signed_v| 超过死区(DIR_DEADZONE), 且同一方向连续
+        DIR_CONFIRM_N 次采样确认后才翻转方向; 死区内维持既有方向。
+        """
+        if abs(self.signed_v) < DIR_DEADZONE:
+            # 死区: 斜率不显著, 维持既有方向 (候选保留, 允许短暂回落后继续确认)
+            return self.drive_direction
+
+        want = 1 if self.signed_v > 0 else -1
+        if want == self.drive_direction:
+            # 与当前方向一致, 清空翻转候选
+            self.dir_candidate = 0
+            self.dir_confirm = 0
+            return self.drive_direction
+
+        if want == self.dir_candidate:
+            self.dir_confirm += 1
+        else:
+            self.dir_candidate = want
+            self.dir_confirm = 1
+
+        if self.dir_confirm >= DIR_CONFIRM_N:
+            self.drive_direction = want
+            self.dir_candidate = 0
+            self.dir_confirm = 0
+        return self.drive_direction
+
+    def reset_drive_direction(self):
+        """车道切换(尤其 S 坐标系反转, 如对向借道)后调用, 方向需基于新车道重新建立"""
+        self.drive_direction = 0
+        self.dir_candidate = 0
+        self.dir_confirm = 0
+
+    def _is_physically_static(self):
+        """基于最近 3 秒原始 2D 轨迹判断目标是否真实静止 (固定设施锁定的运动学证据)"""
+        if len(self.xy_history) < 15:  # 至少 1.5 秒历史
+            return False
+        xs = [p[0] for p in self.xy_history]
+        ys = [p[1] for p in self.xy_history]
+        return (max(xs) - min(xs)) < 1.0 and (max(ys) - min(ys)) < 1.0
+
+    def vote_type(self, sub_type, obj_type, reliability, current_time):
+        """
+        🚗 车型投票锁定机制 (取代旧的"首次非 99 即永久锁定")：
+        - 按感知置信度加权投票, 票数随时间指数衰减 (早期误检影响自动消退)
+        - 占比与帧数双门槛达标才锁定, 杜绝首帧误分类被永久锁死
+        - 锁定后若另一类型持续获得压倒性证据, 允许纠正
+        - 固定设施(13/14)额外要求"物理静止"证据: 行驶中的目标即使被设备
+          误报为设施也不予采纳, 防止车辆被位置锚定机制"钉死"在原地
+        """
+        if sub_type is None or sub_type == 99:
+            return  # 未知类型不投票
+
+        # 置信度归一 (设备未提供有效值时给中性权重)
+        rel = reliability if 0 < reliability <= 1.0 else 0.6
+
+        # 全体票数时间衰减: 让持续稳定的观测主导, 早期偶发误检自动退场
+        for k in list(self.type_votes.keys()):
+            self.type_votes[k] *= TYPE_DECAY
+            if self.type_votes[k] < 0.01:
+                del self.type_votes[k]
+
+        is_fac = sub_type in FIXED_FACILITY_SUB_TYPES
+        if is_fac and self.locked_type is None and not self._is_physically_static():
+            # 行驶中的目标投来的设施票: 大概率是设备误报, 直接丢弃
+            return
+
+        self.type_votes[sub_type] = self.type_votes.get(sub_type, 0.0) + rel
+        self.type_obs_count += 1
+
+        if not self.type_votes:
+            return
+        best_type = max(self.type_votes, key=self.type_votes.get)
+        best_votes = self.type_votes[best_type]
+        total = sum(self.type_votes.values())
+        if total <= 0:
+            return
+        ratio = best_votes / total
+
+        if self.locked_type is None:
+            # ---- 阶段 1: 未锁定, 寻找达标类型 ----
+            if best_type in FIXED_FACILITY_SUB_TYPES:
+                if ratio >= TYPE_FAC_LOCK_RATIO and self.type_obs_count >= TYPE_FAC_LOCK_FRAMES \
+                        and self._is_physically_static():
+                    self.locked_type = best_type
+                    self.locked_obj_type = obj_type
+            elif ratio >= TYPE_LOCK_RATIO and self.type_obs_count >= TYPE_LOCK_FRAMES:
+                self.locked_type = best_type
+                self.locked_obj_type = obj_type
+        else:
+            # ---- 阶段 2: 已锁定, 允许压倒性反证纠正 ----
+            if best_type != self.locked_type and ratio >= TYPE_FIX_RATIO \
+                    and best_votes > self.type_votes.get(self.locked_type, 0.0):
+                # 已锁定为设施且目标确实静止: 保持设施身份, 不纠正
+                if self.locked_type in FIXED_FACILITY_SUB_TYPES and self._is_physically_static():
+                    return
+                old_lock = self.locked_type
+                self.locked_type = best_type
+                self.locked_obj_type = obj_type
+                print(f'[车型纠正] ID:{int(self.fixed_id) % 10000} | {old_lock} -> {best_type}')
 
 
 class LaneQueueTracker:
@@ -445,14 +591,19 @@ class LaneQueueTracker:
                         veh.lane_change_counter = 1
 
                     # 计算它相对【老车道】的真实横向距离，并丢入低通滤波
+                    # ✅ 统一使用滤波后坐标 (与情况A的 S/L 基线完全一致):
+                    #    旧代码用原始雷达坐标投影, 与情况A的滤波坐标之间存在
+                    #    1~2 米的基线差, 车辆一进入变道确认期 S 就会瞬间前跳,
+                    #    触发输出级 3m 硬切保护造成图标跳变
                     old_line = self.map_mgr.lanes[veh.lane_id]['line']
-                    pt = Point(rv.rel_x, rv.rel_y)
+                    pt = Point(match_x, match_y)
                     # dist_to_old = old_line.distance(pt)
-                    dist_to_old = self.map_mgr.get_signed_offset(veh.lane_id, rv.rel_x, rv.rel_y)
+                    dist_to_old = self.map_mgr.get_signed_offset(veh.lane_id, match_x, match_y)
                     veh.update_l(dist_to_old)
 
-                    # 门限确认：连续 5 帧匹配到同一新车道，且滤波后的偏离距离 > 1.2 米
-                    if veh.lane_change_counter >= 5 and abs(veh.filtered_l) > 1.2:  # 1.2
+                    # 门限确认：连续 5 帧匹配到同一新车道，且相对老车道的真实偏离距离 > 1.0 米
+                    # (改用真实距离而非滤波值 filtered_l: 低通滤波的滞后会让确认时机推迟数秒)
+                    if veh.lane_change_counter >= 5 and abs(dist_to_old) > 1.0:
                     # if veh.lane_change_counter >= 5:    # 门限确认：连续 4 帧匹配到同一新车道
                         # ==========================================
                         # �� 新增：变道平滑过渡机制 (目前仅针对海一路双向车道特化)
@@ -485,6 +636,14 @@ class LaneQueueTracker:
                         else:
                             veh.is_changing_lane = False
                             veh.is_reverse_driving = False
+                        # ==========================================
+                        # 🚗 车道系反转检测: 互为对向的车道互变(如海一路借道)时
+                        # S 轴方向翻转, 历史方向状态失效, 需基于新车道重新建立
+                        # ==========================================
+                        old_map_h = self.map_mgr.lanes[veh.lane_id]['heading']
+                        new_map_h = self.map_mgr.lanes[lane_id]['heading']
+                        if abs((old_map_h - new_map_h + 180) % 360 - 180) > 90:
+                            veh.reset_drive_direction()
                         # ==========================================
                         # ✅ 正式确认变道！
                         veh.s_history.clear()
@@ -546,24 +705,20 @@ class LaneQueueTracker:
 
                     veh.s_history.clear()
                     veh.signed_v = 0.0  # <--- 新增：同样重置
+                    veh.reset_drive_direction()  # 🚗 S 坐标系更换, 行驶方向需重新建立
                     veh.lane_id = lane_id
                     veh.s = s
                     veh.target_s = s
                     veh.is_chasing = False
-                    veh.update_l(l)
+                    veh.filtered_l = l  # 🚗 车道系已更换, 直接采用新车道横向偏移 (旧滤波值无连续性意义)
                     veh.v = veh.update_and_estimate_speed(current_time, s)
                     veh.pending_lane_id = None
                     veh.lane_change_counter = 0
+                    # ✅ 保留 out_x/out_y 平滑缓存: 上轨起点承接离道时的最后输出,
+                    #    配合变道动画实现离道->上轨的坐标无缝衔接
 
-                    veh.out_x = veh.raw_x
-                    veh.out_y = veh.raw_y
-
-                # 统一更新基础属性
-                old_sub_type = veh.attrs.get("itc_sub_type", 99)
-                # 只要历史状态中已经有了明确的分类（不是 99 未知），就拒绝新数据的覆盖
-                if old_sub_type != 99:
-                    attrs["itc_sub_type"] = old_sub_type
-                    attrs["itc_obj_type"] = veh.attrs.get("itc_obj_type", 1)
+                # 统一更新基础属性 (🚗 车型投票锁定, 取代旧的"首次非99即永久锁定")
+                self._update_vehicle_type(veh, rv, attrs, current_time)
 
                 veh.attrs = attrs
                 veh.last_radar_time = current_time
@@ -576,6 +731,17 @@ class LaneQueueTracker:
         self._update_physics_queues(current_time, current_radar_ids)
         self._cleanup_stale_vehicles(current_time)
         return self._generate_processed_vehicles(current_time)
+
+    def _update_vehicle_type(self, veh, rv, attrs, current_time):
+        """
+        🚗 车型投票锁定的统一入口: 先投票, 再以锁定结果覆写透传属性。
+        未锁定期间保持设备原始输出, 锁定后以投票裁决值为准。
+        """
+        veh.vote_type(rv.itc_sub_type, rv.itc_obj_type, rv.type_reliability, current_time)
+        if veh.locked_type is not None and attrs.get("itc_sub_type") != veh.locked_type:
+            attrs["itc_sub_type"] = veh.locked_type
+            if veh.locked_obj_type is not None:
+                attrs["itc_obj_type"] = veh.locked_obj_type
 
     def haiyi_match_to_lane(self, old_veh, rv, fixed_id):
         """
@@ -809,7 +975,8 @@ class LaneQueueTracker:
                         veh.is_off_lane = True
                         veh.last_lane_id = veh.lane_id
                         # veh.lane_id = None
-                        veh.out_x = veh.out_y = None
+                        # ✅ 保留 out_x/out_y: 离道后输出从最后平滑位置自然收敛到
+                        #    最后物理位置, 避免图标瞬移
                         veh.is_changing_lane = False  # 打断任何可能的变道动画
                         print(
                             f"[离道拦截] ID:{int(veh.fixed_id) % 10000} 从 490 车道向左(l={veh.filtered_l:.2f})横穿离场，中止推演！")
@@ -952,39 +1119,49 @@ class LaneQueueTracker:
                 # 航向使用原始航向（或车道方向，可由业务决定）
                 heading_rad = math.radians(veh.raw_heading)
                 output_radar_heading = veh.raw_heading
+                # ✅ 离道车辆同样应用输出级平滑: 消除在轨(车道坐标)->离道(物理坐标)
+                #    切换瞬间的图标跳变, 保证全程输出坐标连续
+                x, y = self._alpha_filter_xy(veh, x, y)
             else:
                 x, y = self.map_mgr.get_xy_from_s(veh.lane_id, veh.s)
+                # ==========================================
+                # 🚗 输出融合带符号横向偏移 L:
+                # 旧逻辑只反算 S 坐标, 车辆永远贴在车道中心线上, 变道时输出
+                # 严重滞后于真实位置。融合 L 后输出贴合真实雷达位置, 变道
+                # 确认前车辆即可自然横向滑出, 确认后新老车道的坐标天然连续。
+                # ==========================================
+                lx, ly = self.map_mgr.offset_lateral(veh.lane_id, veh.s, veh.filtered_l)
+                if lx is not None:
+                    x, y = lx, ly
                 map_heading = self.map_mgr.lanes[veh.lane_id]['heading']
                 geo_heading = (90 - map_heading) % 360
                 is_predicted = (current_time - veh.last_radar_time > 100)
 
                 # ==========================================
-                # �� 状态机消费：海一路逆行方向保持
+                # 🚗 航向角最终防线: 由方向滞回状态机裁决 (根治车头 180° 甩头)
+                # 旧策略直接用回归斜率 signed_v 正负(阈值0.5)翻转航向, 低速与
+                # 雷达噪声下斜率在阈值附近抖动, 造成车头前后反复甩动。
+                # 新策略: 只有方向状态机给出明确裁决时才覆写; 方向未知期回落到
+                # 海一路逆行先验 / 雷达反向兼容逻辑兜底。
                 # ==========================================
-                haiyi_lanes = {'137438953490_1', '137438953490_2', '137438953506_1', '137438953506_2'}
-                if veh.lane_id in haiyi_lanes and getattr(veh, 'is_reverse_driving', False):
-                    # 借道超车状态下，将基础航向强制翻转180度
-                    geo_heading = (geo_heading + 180) % 360
-                else:
-                    # 保留原有的雷达反向感知/倒车兼容处理
-                    angle_diff = abs((geo_heading - veh.raw_heading + 180) % 360 - 180)
-                    if angle_diff > 150 and not is_predicted and (veh.lane_id != '137438953490_1' and veh.lane_id != '137438953490_2'):
-                        geo_heading = (geo_heading + 180) % 360
-                        print(f'angle reverse : {int(veh.fixed_id)%10000}')
-
-                # ==========================================
-                # 最终防线 (基于 S 坐标增减的物理事实强制覆写)
-                # ==========================================
-                # 只有当车辆有明显的物理位移时 (速度 > 0.5m/s，屏蔽静止噪点)，才触发绝对覆写
-                signed_v = getattr(veh, 'signed_v', 0.0)
                 base_map_geo = (90 - map_heading) % 360
-
-                if signed_v > 0.5:
-                    # S 增加：说明沿着车道线正向开
+                if veh.drive_direction > 0:
+                    # S 持续增加: 沿车道正向行驶
                     geo_heading = base_map_geo
-                elif signed_v < -0.5:
-                    # S 减小：说明逆着车道线反向开 (倒车/借道逆行)
+                elif veh.drive_direction < 0:
+                    # S 持续减小: 逆车道方向行驶 (倒车/借道逆行)
                     geo_heading = (base_map_geo + 180) % 360
+                else:
+                    # 方向未确认期: 入场/变道先验与雷达反向兼容兜底
+                    if getattr(veh, 'is_reverse_driving', False):
+                        # 借道超车状态下，将基础航向强制翻转180度
+                        geo_heading = (geo_heading + 180) % 360
+                    else:
+                        # 保留原有的雷达反向感知/倒车兼容处理
+                        angle_diff = abs((geo_heading - veh.raw_heading + 180) % 360 - 180)
+                        if angle_diff > 150 and not is_predicted and (veh.lane_id != '137438953490_1' and veh.lane_id != '137438953490_2'):
+                            geo_heading = (geo_heading + 180) % 360
+                            print(f'angle reverse : {int(veh.fixed_id)%10000}')
 
                 # ==========================================
                 # 注入平滑变道曲线与航向角插值
@@ -1063,20 +1240,18 @@ class LaneQueueTracker:
                 veh.last_s = veh.s
                 veh.is_off_lane = True
                 veh.lane_id = None
-                # 可重置输出平滑缓存，避免突变
-                veh.out_x = veh.out_y = None
+                # ✅ 保留输出平滑缓存 out_x/out_y: 在轨最后输出(s+l融合坐标)与
+                #    离道物理坐标本就接近, 保留缓存配合输出级平滑可实现无缝衔接;
+                #    置空反而会造成切换瞬间的图标瞬移
                 veh.is_changing_lane = False  # ✅ 新增：离线时强制打断变道动画
 
             # �� 同步调用坐标与航向的预滤波方法
-            veh.update_raw_xy(rv.rel_x, rv.rel_y)
+            veh.update_raw_xy(rv.rel_x, rv.rel_y, current_time)
             veh.update_raw_heading(rv.radar_heading)
 
 
-            # 离道车辆同步应用车型锁定机制
-            old_sub_type = veh.attrs.get("itc_sub_type", 99)
-            if old_sub_type != 99:
-                attrs["itc_sub_type"] = old_sub_type
-                attrs["itc_obj_type"] = veh.attrs.get("itc_obj_type", 1)
+            # 离道车辆同步应用车型投票锁定机制
+            self._update_vehicle_type(veh, rv, attrs, current_time)
 
             veh.last_radar_time = current_time
             veh.attrs = attrs

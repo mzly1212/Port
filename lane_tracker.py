@@ -878,13 +878,13 @@ class LaneQueueTracker:
             # 即使雷达点就在车身身边（dist < 20.0），只要当前车在海一路上，
             # 且雷达点的航向与历史航向相反（夹角 > 90°），说明这绝对是对向会车车辆的点！
             # 直接一票否决，绝不允许把对向车的点当成自己的分裂噪点认领！
-            # 航向一致性检查 (全车道通用, 海一路更严格)
-            # 近距离但航向夹角过大的两点, 大概率是对向会车而非分裂。
-            angle_diff = abs((veh.raw_heading - rv_heading + 180) % 360 - 180)
-            if not getattr(veh, 'is_reverse_driving', False) and time_diff < 500:
-                thresh = 90 if veh.lane_id in haiyi_lanes else DEDUP_2D_HEADING_THRESH
-                if angle_diff > thresh:
-                    continue
+            # 航向一致性检查 (仅海一路, 严防对向会车误缝合)
+            # 其他车道不做此检查: 感知交界处同一车可能被两个雷达报出不同航向
+            if veh.lane_id in haiyi_lanes:
+                angle_diff = abs((veh.raw_heading - rv_heading + 180) % 360 - 180)
+                if angle_diff > 90 and not getattr(veh, 'is_reverse_driving', False):
+                    if time_diff < 500:
+                        continue
 
             # ==========================================
             # 核心缝合：完整复用原版的两类经典场景
@@ -899,7 +899,7 @@ class LaneQueueTracker:
             # 场景 2: 极近距离雷达瞬间分裂噪点
             # (即使 time_diff <= 100 甚至本帧已匹配过，只要 < 20米，均强行认领！
             # 认领后，外部的 `if fixed_id in current_radar_ids: continue` 会将分裂噪点作为重复项完美抹除)
-            elif dist < DEDUP_2D_SPLIT_DIST:
+            elif dist < 18.0:
                 is_match = True
 
             if is_match and dist < min_dist:
@@ -1035,10 +1035,7 @@ class LaneQueueTracker:
                     if self._is_dedup_exempt(sv_veh):
                         continue
                     s_diff = abs(sv_s - s_val)
-                    # 航向一致性: 对向车(夹角>120)绝不合并, 即使同车道近距离
-                    heading_diff = abs((sv_veh.raw_heading - veh.raw_heading + 180) % 360 - 180)
-                    if s_diff < DEDUP_LANE_S_WINDOW and abs(sv_veh.v - veh.v) < DEDUP_LANE_V_DIFF \
-                            and heading_diff < DEDUP_2D_HEADING_THRESH:
+                    if s_diff < DEDUP_LANE_S_WINDOW and abs(sv_veh.v - veh.v) < DEDUP_LANE_V_DIFF:
                         if sv_veh.last_radar_time >= veh.last_radar_time:
                             ghosts_to_delete.add(veh.fixed_id)
                         else:

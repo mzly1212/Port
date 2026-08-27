@@ -771,7 +771,7 @@ class LaneQueueTracker:
                 dist_2d = math.hypot(v1.raw_x - v2.raw_x, v1.raw_y - v2.raw_y)
 
                 # 判定阈值：2D距离 < 15.0米，且速度差 < 3.0m/s
-                if dist_2d < 15.0:
+                if dist_2d < 18.0:
                     # 仲裁标准与在轨车保持绝对一致：谁拥有更新鲜的雷达数据，谁才是真身！
                     if v1.last_radar_time >= v2.last_radar_time:
                         ghost = v2

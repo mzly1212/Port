@@ -46,6 +46,30 @@ TYPE_FAC_LOCK_RATIO = 0.85  # 固定设施锁定占比门槛 (更严格)
 TYPE_FAC_LOCK_FRAMES = 10   # 固定设施锁定最小观测帧数
 TYPE_FIX_RATIO = 0.8        # 已锁定类型的纠正占比门槛 (反证占压倒性优势才纠正)
 
+# ==========================================
+# 物理一致推演参数 (取代旧的 add_v + v兜底 IDM 盲区推演)
+#   旧策略: add_v=1.5 给所有预测车额外加 1.5m/s, 静止车 v=2.0 兜底,
+#   导致预测车持续超速、静止车漂移、长断联后幽灵车跑到数公里外。
+#   新策略: 指数衰减让预测速度随盲区时间自然收敛到 0,
+#   方向由行驶方向状态机裁决, 恢复时做物理可达性校验。
+# ==========================================
+PRED_SPEED_DECAY_TAU = 3.0  # 速度衰减时间常数(秒): 盲区3秒后速度降至37%, 8秒后降至7%
+PRED_MIN_SPEED = 0.3        # 预测速度下限(m/s): 衰减到此值以下视为静止
+PRED_MAX_GAP_BASE = 5.0     # 恢复时物理可达距离的基础容忍(米, 含噪声余量)
+PRED_MAX_GAP_RATIO = 1.5   # 恢复时物理可达距离的宽容系数 (1.5x 最大物理位移)
+CHASE_MAX_SPEED = 3.0       # 追击最大速度差(m/s): 比真实车快/慢最多 3m/s 温和收敛
+
+# ==========================================
+# 去重策略参数
+#   旧策略: 2D缝合场景2仅看距离<18m无航向检查, 在轨去重仅比较相邻,
+#   离道去重无速度差检查。新策略: 全车道航向一致性+全对比较+速度差。
+# ==========================================
+DEDUP_2D_HEADING_THRESH = 120  # 2D缝合航向否决阈值(度): 夹角>120°视为不同车
+DEDUP_2D_SPLIT_DIST = 12.0     # 2D缝合场景2(近距离分裂)距离阈值(米): 从18m收紧
+DEDUP_LANE_S_WINDOW = 15.0    # 在轨去重S差窗口(米)
+DEDUP_LANE_V_DIFF = 3.0       # 在轨去重速度差阈值(m/s)
+DEDUP_OFFLANE_V_DIFF = 4.0    # 离道去重速度差阈值(m/s): 离道车速度估计更不准, 略宽
+
 
 class VehicleState:
     def __init__(self, obj_id, lane_id, s, l_offset, v, attrs, current_time, rel_x, rel_y, raw_heading):
@@ -854,12 +878,13 @@ class LaneQueueTracker:
             # 即使雷达点就在车身身边（dist < 20.0），只要当前车在海一路上，
             # 且雷达点的航向与历史航向相反（夹角 > 90°），说明这绝对是对向会车车辆的点！
             # 直接一票否决，绝不允许把对向车的点当成自己的分裂噪点认领！
-            if veh.lane_id in haiyi_lanes:
-                angle_diff = abs((veh.raw_heading - rv_heading + 180) % 360 - 180)
-                # �� 修复：如果车辆处于长断联恢复期 (time_diff > 500ms)，第一帧航向极可能是噪点，暂不触发 90 度方向否决
-                if angle_diff > 90 and not getattr(veh, 'is_reverse_driving', False):
-                    if time_diff < 500:  # 仅对连续追踪的车辆实施严苛方向打击
-                        continue
+            # 航向一致性检查 (全车道通用, 海一路更严格)
+            # 近距离但航向夹角过大的两点, 大概率是对向会车而非分裂。
+            angle_diff = abs((veh.raw_heading - rv_heading + 180) % 360 - 180)
+            if not getattr(veh, 'is_reverse_driving', False) and time_diff < 500:
+                thresh = 90 if veh.lane_id in haiyi_lanes else DEDUP_2D_HEADING_THRESH
+                if angle_diff > thresh:
+                    continue
 
             # ==========================================
             # 核心缝合：完整复用原版的两类经典场景
@@ -874,7 +899,7 @@ class LaneQueueTracker:
             # 场景 2: 极近距离雷达瞬间分裂噪点
             # (即使 time_diff <= 100 甚至本帧已匹配过，只要 < 20米，均强行认领！
             # 认领后，外部的 `if fixed_id in current_radar_ids: continue` 会将分裂噪点作为重复项完美抹除)
-            elif dist < 18.0:  # 15
+            elif dist < DEDUP_2D_SPLIT_DIST:
                 is_match = True
 
             if is_match and dist < min_dist:
@@ -936,7 +961,8 @@ class LaneQueueTracker:
                 # 计算两个游离目标的 2D 物理距离
                 dist_2d = math.hypot(v1.raw_x - v2.raw_x, v1.raw_y - v2.raw_y)
 
-                # 判定阈值：2D距离 < 15.0米，且速度差 < 3.0m/s
+                # 判定: 2D距离 < 15米, 且速度差 < DEDUP_OFFLANE_V_DIFF m/s
+                # (旧策略注释写了速度差但代码没做, 导致不同速度的游离车被误合并)
                 if dist_2d < 18.0:
                     # 仲裁标准与在轨车保持绝对一致：谁拥有更新鲜的雷达数据，谁才是真身！
                     if v1.last_radar_time >= v2.last_radar_time:
@@ -992,42 +1018,45 @@ class LaneQueueTracker:
             # 按 s 降序排序
             items.sort(key=lambda x: x[1], reverse=True)
 
-            # ----- 去重逻辑（基于 s 和速度差）-----
+            # ----- 去重逻辑 (全对比较, 取代旧的仅相邻比较) -----
+            # 旧策略只比较排序后相邻元素, A和C应合并但B在中间时漏判。
+            # 新策略: 每个新车检查与所有已有 survivor 的 S 差和速度差。
             survivors = []
+            ghosts_to_delete = set()
             for veh, s_val in items:
-                if not survivors:
+                if veh.fixed_id in ghosts_to_delete:
+                    continue
+                if self._is_dedup_exempt(veh):
                     survivors.append((veh, s_val))
-                else:
-                    leader_veh, leader_s = survivors[-1]
+                    continue
 
-                    # 🚀 固定设施去重豁免：只要任意一方是舱盖板(14)/候工亭/锁销框(13)，
-                    # 本对目标不参与同车道去重合并，防止固定目标被误杀
-                    if self._is_dedup_exempt(leader_veh) or self._is_dedup_exempt(veh):
-                        survivors.append((veh, s_val))
-                    elif (leader_s - s_val) < 15.0 and abs(leader_veh.v - veh.v) < 3.0:
-                        # 仲裁：谁拥有更近的真实雷达点，谁才是真身！
-                        if leader_veh.last_radar_time >= veh.last_radar_time:
-                            ghost = veh  # 丢弃落后的/旧的
-                            survivor = leader_veh
-                            reason = "后车雷达数据陈旧"
+                matched = False
+                for si, (sv_veh, sv_s) in enumerate(survivors):
+                    if self._is_dedup_exempt(sv_veh):
+                        continue
+                    s_diff = abs(sv_s - s_val)
+                    # 航向一致性: 对向车(夹角>120)绝不合并, 即使同车道近距离
+                    heading_diff = abs((sv_veh.raw_heading - veh.raw_heading + 180) % 360 - 180)
+                    if s_diff < DEDUP_LANE_S_WINDOW and abs(sv_veh.v - veh.v) < DEDUP_LANE_V_DIFF \
+                            and heading_diff < DEDUP_2D_HEADING_THRESH:
+                        if sv_veh.last_radar_time >= veh.last_radar_time:
+                            ghosts_to_delete.add(veh.fixed_id)
                         else:
-                            ghost = leader_veh  # 丢弃老的推演车
-                            survivor = veh
-                            survivors[-1] = (veh, s_val)
-                            reason = "前车(推演车)雷达数据陈旧"
+                            ghosts_to_delete.add(sv_veh.fixed_id)
+                            survivors[si] = (veh, s_val)
+                        matched = True
+                        break
 
-                        if ghost.fixed_id in self.active_vehicles:
-                            # �� [新增日志 1]：打印被同车道真实车去重合并的原因
-                            print(
-                                f"��️ [去重合并] 车道:{lane_id} | 删ID:{int(ghost.fixed_id) % 10000} | 留ID:{int(survivor.fixed_id) % 10000} | 原因: {reason} | S相差:{leader_s - s_val:.2f}m")
-                            del self.active_vehicles[ghost.fixed_id]
-                    else:
-                        survivors.append((veh, s_val))
+                if not matched:
+                    survivors.append((veh, s_val))
+
+            for ghost_id in ghosts_to_delete:
+                if ghost_id in self.active_vehicles:
+                    del self.active_vehicles[ghost_id]
 
             # 更新队列为去重后的 (vehicle, s) 列表
             self.lane_queues[lane_id] = survivors
 
-            add_v = 1.5
             # ----- 推演每个车辆的 S（断联推演 or 在线追击）-----
             for idx, (veh, s_val) in enumerate(survivors):
                 if veh.fixed_id not in current_radar_ids:
@@ -1039,69 +1068,65 @@ class LaneQueueTracker:
                         continue
 
                     # ==========================================
-                    # 1. 断联/离线状态：执行 IDM 盲区推演
+                    # 物理一致推演 (取代旧的 add_v + v兜底 IDM)
+                    # 速度随盲区时间指数衰减, 方向由行驶方向状态机裁决,
+                    # 静止车不再被强制赋予 2m/s 速度而漂移。
                     # ==========================================
-                    if veh.v < 1.0:
-                        veh.v = 2.0  # 可调整，建议保守值 1.0~2.0
+                    elapsed = (current_time - veh.last_radar_time) / 1000.0
+                    pred_v = veh.v * math.exp(-elapsed / PRED_SPEED_DECAY_TAU)
 
-                    if idx == 0:
-                        # 头车：匀速
-                        new_s = s_val + (veh.v+add_v) * dt
+                    if pred_v < PRED_MIN_SPEED:
+                        new_s = s_val
                     else:
-                        # 跟车：简单 IDM
-                        leader_veh, leader_s = survivors[idx - 1]
-                        dist = leader_s - s_val
-                        if dist < 15.0:
-                            veh.v = max(0, veh.v - 2.0 * dt)
-                        else:
-                            veh.v = leader_veh.v
-                        new_s = s_val + (veh.v+add_v) * dt
+                        dir_sign = -1.0 if veh.drive_direction < 0 else 1.0
 
-                    # 更新车辆状态
+                        if idx == 0:
+                            new_s = s_val + dir_sign * pred_v * dt
+                        else:
+                            leader_veh, leader_s = survivors[idx - 1]
+                            gap = (leader_s - s_val) * dir_sign
+                            if 0 < gap < 15.0:
+                                pred_v = max(0.0, pred_v - 2.0 * dt)
+                            new_s = s_val + dir_sign * pred_v * dt
+
                     if not veh.is_off_lane:
                         veh.s = new_s
-                        veh.target_s = new_s  # ✅ 断联推演时，两者保持同步
-                        # S 坐标往前推演了，必须同步更新 2D 物理坐标
+                        veh.target_s = new_s
                         px, py = self.map_mgr.get_xy_from_s(veh.lane_id, new_s)
                         if px is not None:
                             veh.raw_x, veh.raw_y = px, py
                     else:
-                        # ⚠️ 恢复原本的脱轨逻辑：离线且脱离车道时，仅记录推演 S
                         veh.last_s = new_s
-
-                    print(f'idm: {int(veh.fixed_id)%10000}-{idx}')
 
                 else:
                     # ==========================================
-                    # 2. 在线/观测状态：正常更新 或 执行推演车追击
+                    # 在线/观测状态: 正常更新或执行推演车追击
                     # ==========================================
                     if getattr(veh, 'is_chasing', False):
-                        # ===== 核心：推演车追击真实车逻辑 =====
                         gap = veh.target_s - veh.s
+                        elapsed = (current_time - veh.last_radar_time) / 1000.0
 
-                        # 如果物理偏差离谱(>30米)，说明 IDM 推演出大错，放弃追击直接瞬移
-                        if abs(gap) > 30.0:
+                        # 物理可达性校验: 恢复点偏差是否在物理极限内
+                        max_gap = veh.v * elapsed * PRED_MAX_GAP_RATIO + PRED_MAX_GAP_BASE
+                        if abs(gap) > max(max_gap, 30.0):
+                            # 偏差远超物理极限, 大概率是新车或关联错误, 直接瞬移
                             veh.s = veh.target_s
                             veh.is_chasing = False
                         else:
-                            catch_speed = 4.0  # 追击速度差：比真实车快/慢 6m/s
-
+                            # 温和追击: 速度差与偏差成正比, 最大 CHASE_MAX_SPEED m/s
+                            catch_speed = min(CHASE_MAX_SPEED, abs(gap) / max(elapsed, 0.5))
                             if gap > 0:
-                                # 推演车在真实车后方，加速追赶
                                 veh.s += (veh.v + catch_speed) * dt
                                 if veh.s >= veh.target_s:
                                     veh.s = veh.target_s
                                     veh.is_chasing = False
                             else:
-                                # �� 修复点：推演车冲过头了，原地等待。
-                                # 但如果真实车停了，或者偏差过大(>15m)，切勿死等，直接硬拉回真实点解除追击！
-                                if gap < -15.0 or veh.v < 0.5:
+                                if veh.v < 0.5:
                                     veh.s = veh.target_s
                                     veh.is_chasing = False
                                 elif veh.s <= veh.target_s:
                                     veh.s = veh.target_s
                                     veh.is_chasing = False
-                    print(f'idm: {int(veh.fixed_id)%10000}-{idx}')
         self.last_update_time = current_time
 
     def _generate_processed_vehicles(self, current_time):

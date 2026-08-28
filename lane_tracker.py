@@ -70,6 +70,18 @@ DEDUP_LANE_S_WINDOW = 15.0    # 在轨去重S差窗口(米)
 DEDUP_LANE_V_DIFF = 3.0       # 在轨去重速度差阈值(m/s)
 DEDUP_OFFLANE_V_DIFF = 4.0    # 离道去重速度差阈值(m/s): 离道车速度估计更不准, 略宽
 
+# ==========================================
+# 离道车航向物理约束参数 (修复噪点航向大幅偏转)
+#   离道车无车道航向约束, 雷达噪点航向随机, 导致图标大幅偏转。
+#   三重防线: 噪点门限(拒绝单帧物理不可能的突变) + 运动矢量纠正
+#   (航向与真实运动方向严重不符且杂乱时用运动方向) + 输出级限转速
+#   (静止目标冻结航向, 运动目标每帧转向有上限)。
+# ==========================================
+HEADING_NOISE_JUMP = 45.0  # 单帧航向突变阈值(度): 连续追踪下超过视为噪点直接拒绝
+HEADING_MAX_RATE = 45.0     # 输出航向最大转速(度/秒): 小客车极限约 90 度/秒
+OFFLANE_MIN_MOTION = 1.5    # 运动矢量推导航向的最小位移(米): 低于此值视为静止
+OFFLANE_HEADING_ERRATIC = 60.0  # 航向杂乱度阈值(度): 最近1秒内任意两帧夹角超过即视为噪点特征
+
 
 class VehicleState:
     def __init__(self, obj_id, lane_id, s, l_offset, v, attrs, current_time, rel_x, rel_y, raw_heading):
@@ -111,6 +123,8 @@ class VehicleState:
         # =====新增：海一路入场轨迹拟合相关状态======
         self.xy_history = deque(maxlen=30)  # 记录最近 3 秒的真实 2D 坐标
         self.haiyi_fitted_heading = None  # 缓存的平滑拟合航向 (地理角)
+        # ===== 离道车航向物理约束 =====
+        self.heading_history = deque(maxlen=10)  # 最近 1 秒的原始雷达航向 (噪点杂乱度检测)
 
         # ===== 新增：平滑变道过渡动画机制 =====
         self.is_changing_lane = False
@@ -204,7 +218,11 @@ class VehicleState:
         在送入地图匹配前，对二维物理坐标进行预平滑。
         不仅能消除雷达高频抖动，更能让 match_to_lane 的评分与横向距离计算更加稳健。
         """
-        # 🚀 固定设施：走"位置锚定"策略 —— 限制移动、消除抖动
+        # 统一记录原始轨迹 (运动矢量推导航向 / 静止判定 / 设施锁定静止证据)
+        # 含固定设施: 设施的 xy_history 是"物理静止"投票锁定的证据来源
+        self.xy_history.append((new_x, new_y))
+
+        # 固定设施：走"位置锚定"策略 —— 限制移动、消除抖动
         if self.attrs.get("itc_sub_type", 99) in FIXED_FACILITY_SUB_TYPES:
             return self._update_fixed_facility_xy(new_x, new_y, current_time)
 
@@ -269,24 +287,71 @@ class VehicleState:
     # ==========================================
     # �� 新增：原始雷达航向角环形预滤波方法
     # ==========================================
-    def update_raw_heading(self, new_heading):
+    def update_raw_heading(self, new_heading, time_diff_ms=None, noise_gate=False):
         """
         对原始雷达航向角进行一阶低通滤波（严格解决 360° 环形临界点插值错误）
         避免在 0° 和 360° 交界处滤波时发生 180° 甩头异变。
-        """
-        alpha = 0.2  # 滤波系数：30% 信任新航向，70% 保持惯性
 
-        # 🚀 固定设施：航向恒定，用更重的滤波彻底抑制图标旋转抖动
-        if self.attrs.get("itc_sub_type", 99) in FIXED_FACILITY_SUB_TYPES:
-            alpha = 0.05
+        noise_gate=True 时启用噪点门限: 连续追踪下(time_diff < 500ms)单帧突变
+        超过 HEADING_NOISE_JUMP 度, 物理上不可能(任何车辆横摆率都达不到),
+        直接拒绝该次观测, 防止噪点航向拉偏滤波器状态。
+        """
+        # 记录原始航向用于杂乱度检测 (噪点航向随机, 真实车航向稳定)
+        self.heading_history.append(new_heading)
 
         # 1. 计算两角之间的最短几何路径差 (-180° ~ 180°)
         # 例如：old = 350, new = 10 -> diff = (10 - 350 + 180)%360 - 180 = +20
         diff = (new_heading - self.raw_heading + 180) % 360 - 180
 
+        # 噪点门限: 连续追踪下单帧突变超过阈值, 拒绝本次观测
+        if noise_gate and time_diff_ms is not None and time_diff_ms < 500 \
+                and abs(diff) > HEADING_NOISE_JUMP:
+            return self.raw_heading
+
+        alpha = 0.2  # 滤波系数：20% 信任新航向，80% 保持惯性
+
+        # 固定设施：航向恒定，用更重的滤波彻底抑制图标旋转抖动
+        if self.attrs.get("itc_sub_type", 99) in FIXED_FACILITY_SUB_TYPES:
+            alpha = 0.05
+
         # 2. 沿最短路径累加滤波增量，并归一化至 0° ~ 360°
         self.raw_heading = (self.raw_heading + alpha * diff) % 360
         return self.raw_heading
+
+    def get_motion_heading(self, min_disp=None):
+        """
+        从最近 3 秒轨迹的位移矢量推导运动方向 (度, 数学坐标系, 与雷达航向同约定)。
+        位移不足 min_disp 时返回 None (视为静止, 航向无物理意义)。
+        这是"轨迹物理校验"的核心: 噪点坐标乱跳但航向可随感知乱转,
+        而真实运动方向只由位移矢量决定, 物理上不可伪造。
+        """
+        if min_disp is None:
+            min_disp = OFFLANE_MIN_MOTION
+        if len(self.xy_history) < 8:
+            return None
+        x0, y0 = self.xy_history[0]
+        x1, y1 = self.xy_history[-1]
+        dx, dy = x1 - x0, y1 - y0
+        if math.hypot(dx, dy) < min_disp:
+            return None
+        return math.degrees(math.atan2(dy, dx)) % 360
+
+    def is_heading_erratic(self, thresh=None):
+        """
+        最近 1 秒的雷达航向是否杂乱无章 (噪点特征):
+        任意两帧夹角超过 thresh 度即判定为杂乱。
+        真实车辆(无论前行还是倒车)航向在 1 秒内必然稳定, 噪点则随机乱转。
+        """
+        if thresh is None:
+            thresh = OFFLANE_HEADING_ERRATIC
+        hs = list(self.heading_history)
+        if len(hs) < 4:
+            return False
+        for i in range(len(hs)):
+            for j in range(i + 1, len(hs)):
+                if abs((hs[i] - hs[j] + 180) % 360 - 180) > thresh:
+                    return True
+        return False
 
     def update_and_estimate_speed(self, current_time, current_s):
         """
@@ -775,7 +840,7 @@ class LaneQueueTracker:
         hijacked_heading = None  # �� 新增：记录需要向外传递的劫持航向角
 
         if old_veh:
-            old_veh.xy_history.append((rv.rel_x, rv.rel_y))
+            # xy_history 已在 update_raw_xy 中统一记录 (含离道车与设施), 此处不再重复追加
 
             if '137438953506_1' in self.map_mgr.lanes and '137438953490_2' in self.map_mgr.lanes:
                 line_506 = self.map_mgr.lanes['137438953506_1']['line']
@@ -1138,9 +1203,37 @@ class LaneQueueTracker:
             if veh.is_off_lane:
                 # 已经脱离车道，放弃 S 坐标约束，直接使用自带滤波的 2D 物理坐标
                 x, y = veh.raw_x, veh.raw_y
-                # 航向使用原始航向（或车道方向，可由业务决定）
-                heading_rad = math.radians(veh.raw_heading)
-                output_radar_heading = veh.raw_heading
+                # ==========================================
+                # 离道车航向物理约束 (修复噪点航向大幅偏转):
+                # 旧逻辑直接透传低通后的雷达航向, 离道车无车道航向约束,
+                # 噪点航向随机导致图标大幅偏转, 前端观感极差。
+                # 新逻辑三重防线:
+                # 1) 雷达航向与运动方向严重不符且航向杂乱(噪点特征) -> 用运动矢量纠正
+                # 2) 静止(无明显位移) -> 冻结航向, 彻底不随噪点旋转
+                # 3) 输出级限转速, 任何情况图标都不会瞬间大幅偏转
+                # ==========================================
+                target_h = veh.raw_heading
+                motion_h = veh.get_motion_heading()
+                if motion_h is not None:
+                    h_diff = abs((veh.raw_heading - motion_h + 180) % 360 - 180)
+                    if h_diff > 90 and veh.is_heading_erratic():
+                        # 航向与真实运动方向严重不符且杂乱无章: 噪点, 用运动方向纠正
+                        # (倒车等航向稳定但与运动反向的场景不受影响: 稳定则不杂乱)
+                        target_h = motion_h
+                else:
+                    # 静止目标: 冻结航向(保持上帧输出), 图标完全不旋转
+                    target_h = veh.out_heading if veh.out_heading is not None else veh.raw_heading
+
+                # 输出级限转速: 每帧最多转 HEADING_MAX_RATE/10 度 (按 10Hz)
+                if veh.out_heading is None:
+                    veh.out_heading = target_h
+                d_h = (target_h - veh.out_heading + 180) % 360 - 180
+                max_step = HEADING_MAX_RATE / 10.0
+                d_h = max(-max_step, min(max_step, d_h))
+                veh.out_heading = (veh.out_heading + d_h) % 360
+
+                heading_rad = math.radians(veh.out_heading)
+                output_radar_heading = veh.out_heading
                 # ✅ 离道车辆同样应用输出级平滑: 消除在轨(车道坐标)->离道(物理坐标)
                 #    切换瞬间的图标跳变, 保证全程输出坐标连续
                 x, y = self._alpha_filter_xy(veh, x, y)
@@ -1267,9 +1360,12 @@ class LaneQueueTracker:
                 #    置空反而会造成切换瞬间的图标瞬移
                 veh.is_changing_lane = False  # ✅ 新增：离线时强制打断变道动画
 
-            # �� 同步调用坐标与航向的预滤波方法
+            # 🚗 同步调用坐标与航向的预滤波方法
             veh.update_raw_xy(rv.rel_x, rv.rel_y, current_time)
-            veh.update_raw_heading(rv.radar_heading)
+            # 噪点门限: 离道车无车道航向约束, 拒绝单帧物理不可能的航向突变
+            veh.update_raw_heading(rv.radar_heading,
+                                   time_diff_ms=current_time - veh.last_radar_time,
+                                   noise_gate=True)
 
 
             # 离道车辆同步应用车型投票锁定机制

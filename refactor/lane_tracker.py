@@ -25,10 +25,14 @@ lane_tracker.py — 感知平滑跟踪器 (六阶段流水线)
        新车测速暂态期 v 偏低, 仅靠速度差会漏判。150° 阈值不阻断感知交界处
        同车双报的合法缝合 (历史教训: 90°~120° 曾误伤, 已回退)。
     3. 缝合重连跳变平滑: 同车道重连位置跳变 >2m 时启动输出过渡动画
-       (复用变道动画机制), 消除缝合瞬间的画面瞬移; 跳变 >15m 视为关联
-       错误直接硬切。
-    4. 海一路车道集合/阈值统一为 tracker_params 常量, 消除 5 处重复定义。
-    5. lane_queues 从实例字段降级为局部变量 (它每帧重建, 从未被跨帧读取)。
+       (复用变道动画机制), 消除缝合瞬间的画面瞬移; 保留测速历史与方向
+       状态不清空, 纵向收敛交给追击/棘轮机制, 与旧版一致。
+       (教训: 曾在缝合时 hard_reset 清历史, ID 跳变高发区方向状态机
+        永远无法确认, 车头退回雷达航向兜底而来回翻转/倒行, 已回退)
+    4. 车道边缘短暂离道 (<1s 重回原车道) 不硬重置方向状态与测速历史:
+       按同车道测量继续处理, 防止边缘抖动导致车头来回翻转。
+    5. 海一路车道集合/阈值统一为 tracker_params 常量, 消除 5 处重复定义。
+    6. lane_queues 从实例字段降级为局部变量 (它每帧重建, 从未被跨帧读取)。
 """
 
 import math
@@ -49,7 +53,7 @@ from tracker_params import (
     SUTURE_HEADING_VETO_GLOBAL, SUTURE_REJOIN_ANIM_MAX, CHASE_TRIGGER_DIST,
     DEDUP_LANE_S_WINDOW, DEDUP_LANE_V_DIFF, DEDUP_OFFLANE_DIST,
     HEADING_MAX_RATE, HEADING_MOTION_CONFLICT,
-    LANE_CHANGE_CONFIRM_FRAMES, LANE_CHANGE_CONFIRM_DIST,
+    LANE_CHANGE_CONFIRM_FRAMES, LANE_CHANGE_CONFIRM_DIST, REENTRY_BLIP_MS,
     NEW_VEHICLE_GRACE_MS, OFFLANE_TIMEOUT_MS, ONLANE_TIMEOUT_MS,
     PREDICTED_FLAG_MS, RECENT_GAP_MS,
     OUTPUT_SMOOTH_ALPHA, OUTPUT_HARD_CUT_DIST,
@@ -158,7 +162,8 @@ class LaneQueueTracker:
         input_heading = hijacked_heading if hijacked_heading is not None else rv.radar_heading
         if old_veh is not None:
             match_x, match_y = old_veh.update_raw_xy(rv.rel_x, rv.rel_y, current_time)
-            match_heading = old_veh.update_raw_heading(input_heading)
+            match_heading = old_veh.update_raw_heading(input_heading,
+                                                       current_time=current_time)
         else:
             match_x, match_y = rv.rel_x, rv.rel_y
             match_heading = input_heading
@@ -195,7 +200,8 @@ class LaneQueueTracker:
                 # 现在用老车的滤波器重新处理观测并重新匹配, 基线全程一致。
                 # =================================================
                 match_x, match_y = old_veh.update_raw_xy(rv.rel_x, rv.rel_y, current_time)
-                match_heading = old_veh.update_raw_heading(rv.radar_heading)
+                match_heading = old_veh.update_raw_heading(rv.radar_heading,
+                                                            current_time=current_time)
                 lane_id, s, l = self.map_mgr.match_to_lane(
                     match_x, match_y,
                     veh_heading=match_heading,
@@ -206,11 +212,14 @@ class LaneQueueTracker:
                 # ---- 缝合重连跳变平滑 ----
                 # 同车道重连但位置跳变超过阈值: 输出从上帧视觉位置过渡到
                 # 新轨迹 (复用变道动画), 消除缝合瞬间的画面瞬移。
-                # 跳变过大 (> 15m, 大概率关联错误) 放弃动画直接硬切。
+                # ⚠ 绝不在此清空测速历史 (hard_reset_s): ID 跳变高发区若
+                # 每次缝合都清历史, 方向状态机永远无法确认(需 >1s 的历史
+                # 点 + 5 帧确认), 车头会退化到雷达航向兜底而来回翻转/倒行。
+                # 纵向跳变交给 apply_radar_s 的追击/棘轮机制自然收敛,
+                # 与旧版行为一致。
                 if lane_id is not None and lane_id == old_veh.lane_id \
                         and abs(s - old_veh.s) > CHASE_TRIGGER_DIST:
                     self._start_rejoin_animation(old_veh, lane_id, s, current_time)
-                    old_veh.hard_reset_s(s)
 
         attrs = {
             "itc_obj_type": rv.itc_obj_type,
@@ -341,7 +350,13 @@ class LaneQueueTracker:
             # 其他车道: 仅近乎正对 (>150°) 才否决 —— 感知交界处同车双报
             #   的航向差通常 < 150°, 而对向车必 > 150°, 以此区分。
             #   (历史教训: 全车道 90°~120° 否决曾阻断交界处合法缝合, 已回退)
-            if time_diff < SUTURE_HEADING_VETO_MS and not veh.is_reverse_driving:
+            # ---- 前后混淆豁免 ----
+            # 老车近数秒内观测航向出现过 >120° 单帧跳变 (前后混淆签名)时,
+            # 雷达航向对该车不可信, 航向否决依据失效 —— 放行缝合,
+            # 位置连续性是唯一可靠证据。真对向车航向稳定, 不触发豁免。
+            heading_unreliable = veh.heading_recently_flipped(current_time)
+            if time_diff < SUTURE_HEADING_VETO_MS and not veh.is_reverse_driving \
+                    and not heading_unreliable:
                 angle_diff = ang_diff_deg(veh.raw_heading, rv_heading)
                 if veh.lane_id in HAIYI_LANES:
                     if angle_diff > SUTURE_HEADING_VETO:
@@ -487,6 +502,19 @@ class LaneQueueTracker:
 
     def _handle_reentry(self, veh, lane_id, s, l, current_time):
         """离道游离 -> 上轨: 记录时空偏差启动动画 + 硬切重置坐标系"""
+        # 车道边缘短暂抖动 (离道 < REENTRY_BLIP_MS 且重回原车道):
+        # 保留方向状态机与测速历史, 按同车道测量处理。
+        # ⚠ 若每次边缘抖动都硬重置, 方向永远无法确认, 车头会退回
+        # 雷达航向兜底 (前后混淆时) 而长期倒行/来回翻转。
+        if veh.last_lane_id == lane_id and veh.went_off_lane_time is not None \
+                and current_time - veh.went_off_lane_time < REENTRY_BLIP_MS:
+            veh.lane_id = lane_id
+            veh.update_l(l)
+            veh.apply_radar_s(current_time, s)
+            veh.pending_lane_id = None
+            veh.lane_change_counter = 0
+            return
+
         new_x, new_y = self.map_mgr.get_xy_from_s(lane_id, s)
         if new_x is not None:
             veh.is_changing_lane = True
@@ -543,12 +571,14 @@ class LaneQueueTracker:
                 veh.is_off_lane = True
                 veh.lane_id = None
                 veh.is_changing_lane = False  # 打断变道动画
+                veh.went_off_lane_time = current_time  # 边缘抖动判定基准
 
             veh.update_raw_xy(rv.rel_x, rv.rel_y, current_time)
             # 噪点门限: 离道车无车道航向约束, 拒绝物理不可能的单帧突变
             veh.update_raw_heading(rv.radar_heading,
                                    time_diff_ms=current_time - veh.last_radar_time,
-                                   noise_gate=True)
+                                   noise_gate=True,
+                                   current_time=current_time)
 
             self._update_vehicle_type(veh, rv, attrs, current_time)
             veh.last_radar_time = current_time
@@ -573,7 +603,7 @@ class LaneQueueTracker:
 
         self._dedup_off_lane()
         lane_groups = self._collect_on_lane(current_time, current_radar_ids)
-        deduped_groups = self._dedup_on_lane(lane_groups)
+        deduped_groups = self._dedup_on_lane(lane_groups, current_time)
         self._advance_lane_physics(current_time, current_radar_ids, deduped_groups, dt)
 
         self.last_update_time = current_time
@@ -638,7 +668,7 @@ class LaneQueueTracker:
 
         return lane_groups
 
-    def _dedup_on_lane(self, lane_groups):
+    def _dedup_on_lane(self, lane_groups, current_time):
         """
         在轨同车道去重 (全对比较):
         S 差 < 15m 且速度差 < 3 m/s 视为分裂,
@@ -668,8 +698,13 @@ class LaneQueueTracker:
                     # 航向近乎正对 (>150°) 的两车是同车道对向行驶, 绝非分裂
                     # (分裂回波航向差通常远小于 150°; 新车测速暂态期 v 偏低,
                     #  仅靠速度差会漏判对向车, 航向是更硬的物理证据)
+                    # 前后混淆豁免: 任一方近数秒内观测航向出现过 >120° 单帧
+                    # 跳变时其雷达航向不可信, 该否决失效 (放行合并,
+                    # 交给位置/速度仲裁)
                     if ang_diff_deg(sv_veh.raw_heading, veh.raw_heading) \
-                            > SUTURE_HEADING_VETO_GLOBAL:
+                            > SUTURE_HEADING_VETO_GLOBAL \
+                            and not (sv_veh.heading_recently_flipped(current_time)
+                                     or veh.heading_recently_flipped(current_time)):
                         continue
                     s_diff = abs(sv_s - s_val)
                     if s_diff < DEDUP_LANE_S_WINDOW \

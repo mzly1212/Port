@@ -22,6 +22,7 @@ from tracker_params import (
     TYPE_FAC_LOCK_RATIO, TYPE_FAC_LOCK_FRAMES, TYPE_FIX_RATIO,
     CHASE_TRIGGER_GAP_MS, CHASE_TRIGGER_DIST,
     HEADING_NOISE_JUMP, OFFLANE_MIN_MOTION, OFFLANE_HEADING_ERRATIC,
+    HEADING_FLIP_MARK, HEADING_FLIP_TRUST_MS,
     ang_diff_deg,
 )
 
@@ -44,6 +45,7 @@ class VehicleState:
         self.last_lane_id = lane_id   # 离道前最后绑定车道
         self.last_s = s
         self.is_off_lane = lane_id is None
+        self.went_off_lane_time = None  # 转入离道的时刻 (边缘抖动判定)
 
         # ---- 变道意图确认状态机 ----
         self.pending_lane_id = None
@@ -56,6 +58,7 @@ class VehicleState:
         self.s_history.append((current_time, s))
         self.xy_history = deque(maxlen=30)     # 3 秒原始 2D 轨迹 (运动矢量/静止证据)
         self.heading_history = deque(maxlen=10)  # 1 秒原始航向 (杂乱度检测)
+        self.heading_flip_times = deque(maxlen=10)  # >120° 航向跳变时刻 (前后混淆标记)
 
         # ---- 原始测量滤波 ----
         self.raw_x = rel_x
@@ -178,15 +181,23 @@ class VehicleState:
 
         return self.raw_x, self.raw_y
 
-    def update_raw_heading(self, new_heading, time_diff_ms=None, noise_gate=False):
+    def update_raw_heading(self, new_heading, time_diff_ms=None, noise_gate=False,
+                           current_time=None):
         """
         航向角环形低通滤波 (解决 0°/360° 交界插值错误)。
         noise_gate=True: 连续追踪下单帧突变超过 HEADING_NOISE_JUMP 度
         直接拒绝 (物理上不可能的横摆率)。
+        同时标记 >120° 跳变时刻 (前后混淆签名, 供缝合/去重豁免查询):
+        真实转弯的滤波滞后约 36°/帧, 单帧 >120° 只可能是前后混淆。
         """
         self.heading_history.append(new_heading)
 
         diff = (new_heading - self.raw_heading + 180) % 360 - 180
+
+        # 前后混淆标记: 无论本次观测是否被噪点门限拒绝,
+        # 雷达报出 >120° 的单帧跳变本身就是"该车航向不可信"的证据
+        if abs(diff) > HEADING_FLIP_MARK and current_time is not None:
+            self.heading_flip_times.append(current_time)
 
         if noise_gate and time_diff_ms is not None and time_diff_ms < 500 \
                 and abs(diff) > HEADING_NOISE_JUMP:
@@ -195,6 +206,15 @@ class VehicleState:
         alpha = 0.05 if self.is_fixed_facility else 0.2
         self.raw_heading = (self.raw_heading + alpha * diff) % 360
         return self.raw_heading
+
+    def heading_recently_flipped(self, current_time, window_ms=None):
+        """近 window_ms 内雷达航向是否出现过 >120° 单帧跳变 (前后混淆)。
+        真对向车航向稳定永不触发; 触发说明该车雷达航向不可信,
+        航向否决依据失效, 缝合/去重应回到位置连续性仲裁。"""
+        if window_ms is None:
+            window_ms = HEADING_FLIP_TRUST_MS
+        return any(current_time - ft <= window_ms
+                   for ft in self.heading_flip_times)
 
     def update_l(self, raw_l):
         """

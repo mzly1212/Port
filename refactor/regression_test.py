@@ -14,6 +14,7 @@ from data import RawVehicle, RawFrame
 from config import Config
 from lane_tracker import VehicleState
 from smooth_engine import PerceptionFilterEngine
+from tracker_params import ang_diff_deg
 
 PASS = 0
 FAIL = 0
@@ -398,6 +399,76 @@ def main():
         print('  [SKIP] 490 车道不可用')
     else:
         check('490 横穿离场拦截生效', bool(r))
+
+    # ================= T11: ID 跳变下方向状态机存续 =================
+    # 部署回归: 感知交界/遮挡导致 ID 频繁跳变, 若每次缝合都清空测速历史,
+    # 方向永远无法确认, 车头退化到雷达航向兜底 (前后混淆时) 来回翻转/倒行
+    print('\n== T11: ID 跳变下方向稳定 ==')
+
+    def run_id_jump():
+        eng, mm, bearing, line_len = get_ctx()
+        t = 0
+        s = 30.0
+        vid = 20001
+        outs = []
+        for i in range(260):
+            t += 100
+            s += 0.4
+            # 每 1.5s 模拟一次感知交界交接: 3 帧检测间隙 + ID 跳变,
+            # 新雷达簇首 3 帧报告位置前偏 +4m (标定/视角偏差)
+            in_gap = (i % 15) in (0, 1, 2)
+            if i > 0 and i % 15 == 0:
+                vid += 1
+            if in_gap and i > 0:
+                continue
+            handoff = 4.0 if (i % 15) in (3, 4, 5) else 0.0
+            x, y = mm.offset_lateral(A, min(s + handoff, line_len - 1.0), 0.0)
+            # 雷达前后混淆: 每 1 秒反向一次
+            h = bearing if (i // 10) % 2 == 0 else (bearing + 180) % 360
+            pf = eng.process_frame(RawFrame(timestamp_ms=t, vehicles=[mk_rv(vid, x, y, h)]))
+            for pv in pf.vehicles:
+                if pv.fixed_id == 20001:
+                    outs.append(pv.radar_heading)
+        v = eng.tracker.active_vehicles.get(20001)
+        return outs, (v.drive_direction if v else None), bearing
+
+    outs11, final_dir, bearing = quiet(run_id_jump)
+    flips_after_warm = sum(1 for h in outs11[40:] if ang_diff_deg(h, bearing) > 90)
+    check('ID 频繁跳变: 车头不来回翻转', flips_after_warm == 0,
+          f'({flips_after_warm} 帧)')
+    check('ID 频繁跳变: 方向最终确认 = 正向', final_dir == 1,
+          f'(dir={final_dir})')
+
+    # ================= T12: 车道边缘短暂离道不重置方向 =================
+    # 部署回归: 边缘位置噪声造成单帧离道又回轨, 若每次重回都硬重置,
+    # 方向永远无法确认; 雷达前后混淆时车头长期倒行
+    print('\n== T12: 边缘抖动方向保持 ==')
+
+    def run_edge_blip():
+        eng, mm, bearing, line_len = get_ctx()
+        t = 0
+        s = 30.0
+        outs = []
+        for i in range(200):
+            t += 100
+            s += 0.3
+            # 常态贴车道边缘行驶, 每 1s 一帧噪声推到界外 (> 2.5m)
+            la = 2.2 if i % 10 != 5 else 3.4
+            x, y = mm.offset_lateral(A, min(s, line_len - 1.0), la)
+            # 雷达持续前后混淆 (一直报反向)
+            h = (bearing + 180) % 360
+            pf = eng.process_frame(RawFrame(timestamp_ms=t,
+                                            vehicles=[mk_rv(30001, x, y, h)]))
+            for pv in pf.vehicles:
+                if pv.fixed_id == 30001:
+                    outs.append(pv.radar_heading)
+        return outs
+
+    outs12 = quiet(run_edge_blip)
+    warm = outs12[30:]
+    backward = sum(1 for h in warm if ang_diff_deg(h, bearing) > 90)
+    check('边缘抖动 + 雷达前后混淆: 车头保持正向',
+          backward <= len(warm) * 0.05, f'({backward}/{len(warm)} 帧)')
 
     print(f'\n========== 结果: {PASS} PASS / {FAIL} FAIL ==========')
     return 0 if FAIL == 0 else 1

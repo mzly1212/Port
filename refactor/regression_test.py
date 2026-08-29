@@ -470,6 +470,45 @@ def main():
     check('边缘抖动 + 雷达前后混淆: 车头保持正向',
           backward <= len(warm) * 0.05, f'({backward}/{len(warm)} 帧)')
 
+    # ================= T13: 堆场车道航向严格锁定 =================
+    # 业务规则: 堆场内车道不存在逆行, 任何"逆行"迹象都是感知错误
+    print('\n== T13: 堆场车道航向锁定 ==')
+
+    def run_duichang_lock():
+        """车在堆场车道正向行驶, 雷达持续报反向航向 + 测速噪声
+        误判方向翻转: 输出航向必须恒等于车道正向"""
+        eng, mm, bearing, line_len = get_ctx()
+        t = 0
+        s = 30.0
+        outs = []
+        dirs = []
+        for i in range(120):
+            t += 100
+            # 后半程加入反向测速噪声, 试图把方向状态机拖到 -1
+            if i < 60:
+                s += 0.4
+            else:
+                s += -0.2 + 0.5 * math.sin(t / 800.0)
+            x, y = mm.offset_lateral(A, min(max(s, 1.0), line_len - 1.0), 0.0)
+            h = (bearing + 180) % 360  # 雷达持续前后混淆报反向
+            pf = eng.process_frame(RawFrame(timestamp_ms=t,
+                                            vehicles=[mk_rv(31001, x, y, h)]))
+            veh = eng.tracker.active_vehicles.get(31001)
+            dirs.append(veh.drive_direction if veh else 'GONE')
+            for pv in pf.vehicles:
+                if pv.fixed_id == 31001:
+                    outs.append(pv.radar_heading)
+        return outs, dirs, bearing
+
+    outs13, dirs13, bearing = run_duichang_lock()
+    warm13 = outs13[30:]
+    max_err = max(ang_diff_deg(h, bearing) for h in warm13)
+    flips13 = sum(1 for a, b in zip(outs13, outs13[1:])
+                  if ang_diff_deg(a, b) > 90)
+    check('堆场车道: 雷达报反向航向, 输出恒锁车道正向 (< 30°)',
+          max_err < 30, f'(max_err={max_err:.1f}°)')
+    check('堆场车道: 无 180° 航向翻转', flips13 == 0, f'({flips13} 次)')
+
     print(f'\n========== 结果: {PASS} PASS / {FAIL} FAIL ==========')
     return 0 if FAIL == 0 else 1
 

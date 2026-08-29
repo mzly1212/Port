@@ -66,6 +66,13 @@ from tracker_params import (
     ang_diff_deg, geo_heading_of,
 )
 
+# ===== 特殊业务车道: 堆场内车道 =====
+# 业务上这些车道不存在逆行, 车头航向严格锁定为车道正向:
+# 跳过方向状态机 -1 分支 / 逆行先验 / 雷达反向兼容等一切翻转逻辑。
+# (车道清单在 config.py SPECIAL_LINES['DUICHANG'], 此处只读引用)
+DUICHANG_LANES = frozenset(
+    getattr(Config, 'SPECIAL_LINES', {}).get('DUICHANG', []))
+
 
 class LaneQueueTracker:
     def __init__(self, map_manager):
@@ -897,6 +904,7 @@ class LaneQueueTracker:
     def _compose_onlane_heading(self, veh, current_time):
         """
         在轨车航向合成 (优先级从高到低):
+          0. 堆场车道锁定: 业务上不存在逆行, 严格锁定车道正向
           1. 方向滞回状态机裁决 (有 5 帧确认, 即时生效)
           2. 方向未知期: 海一路逆行先验 is_reverse_driving
           3. 方向未知期: 雷达反向兼容 (>150° 翻转, 海一路 490 除外)
@@ -907,6 +915,11 @@ class LaneQueueTracker:
         """
         map_heading = self.map_mgr.lanes[veh.lane_id]['heading']
         base_geo = geo_heading_of(map_heading)
+
+        # 堆场车道: 车头严格锁定车道正向。测速噪声误判 drive_direction=-1、
+        # 雷达前后混淆报反向航向等一切"逆行"迹象都是感知错误, 不进画面。
+        if veh.lane_id in DUICHANG_LANES:
+            return base_geo
 
         if veh.drive_direction > 0:
             return base_geo

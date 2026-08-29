@@ -15,6 +15,15 @@ from shapely.geometry import Point
 # ==========================================
 FIXED_FACILITY_SUB_TYPES = {13, 14}
 
+# ==========================================
+# ===== 特殊业务车道: 堆场内车道 =====
+# 业务上这些车道不存在逆行, 车头航向严格锁定为车道正向:
+# 跳过方向状态机 -1 分支 / 逆行先验 / 雷达反向兼容等一切翻转逻辑。
+# (车道清单在 config.py SPECIAL_LINES['DUICHANG'], 此处只读引用)
+# ==========================================
+DUICHANG_LANES = frozenset(
+    getattr(Config, 'SPECIAL_LINES', {}).get('DUICHANG', []))
+
 # 固定设施锚定参数
 FACILITY_ANCHOR_SAMPLES = 10     # 锚点确认采样帧数 (10Hz 下约 1 秒)
 FACILITY_JITTER_DEADZONE = 0.5   # 抖动静区：偏移 <= 0.5m 视为传感器波动，坐标钉死在锚点
@@ -1260,7 +1269,13 @@ class LaneQueueTracker:
                 # 海一路逆行先验 / 雷达反向兼容逻辑兜底。
                 # ==========================================
                 base_map_geo = (90 - map_heading) % 360
-                if veh.drive_direction > 0:
+                if veh.lane_id in DUICHANG_LANES:
+                    # 堆场车道: 业务上不存在逆行, 车头严格锁定车道正向。
+                    # 测速噪声误判 drive_direction=-1、雷达前后混淆报反向
+                    # 航向等一切"逆行"迹象都是感知错误, 不进画面。
+                    # (方向状态机本身不动, 不影响测速与 s 滤波)
+                    geo_heading = base_map_geo
+                elif veh.drive_direction > 0:
                     # S 持续增加: 沿车道正向行驶
                     geo_heading = base_map_geo
                 elif veh.drive_direction < 0:

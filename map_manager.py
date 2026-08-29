@@ -41,7 +41,7 @@ class ZoneManager:
 class MapManager:
     def __init__(self, geojson_path):
         self.lanes = {}  # lane_uid -> dict(LineString, properties)
-        self.line_se = Config.LINE_SE2  # 各车道起止点
+        self.line_se = Config.LINE_SE4  # 各车道起止点
         self.zone_mgr = ZoneManager(getattr(Config, 'SPECIAL_AREAS', {}))
         self.load_map(geojson_path)
 

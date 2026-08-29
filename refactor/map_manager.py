@@ -215,17 +215,17 @@ class MapManager:
 
 
                 # [Fix: 航向角瞬时噪点豁免机制]
-                # 默认最大允许 45 度偏差。
-                angle_threshold = 45.0
+                # 默认最大允许 90 度偏差。
+                angle_threshold = 90.0
 
                 # 🚀 规范化调用：向 ZoneManager 询问当前点是否在 T 字交叉路口区域
                 in_t_area = self.zone_mgr.is_in_zone(x, y, 'AREA_T')
+                in_t_area_r = self.zone_mgr.is_in_zone(x, y, 'AREA_T_R')
 
-                if not in_t_area:
-                    # 只有在非 T 字区域的普通路段，才赋予老车道或极近距离的 90 度航向角豁免
+                if in_t_area or in_t_area_r:
                     # T 字路口急转弯时，绝对禁止 90 度豁免，必须用严格的 45 度斩断老车道粘滞！
                     if (last_lane_id is not None and uid == last_lane_id) or dist < 2:
-                        angle_threshold = 90.0
+                        angle_threshold = 45.0
 
                 if effective_angle_diff > angle_threshold:  # 如果车辆实际航向与车道走向夹角大于动态阈值，拒绝匹配！
                     print('angle_threshold continue')

@@ -2,6 +2,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import socket
+import selectors
 import json
 
 from config import Config
@@ -37,58 +38,75 @@ def main():
         replay_file = open(raw_replay_path, "a", encoding="utf-8")
         logger.info(f"💾 原始数据落盘已开启，将保存至: {raw_replay_path}")
 
-    # 建立 UDP 监听星云互联数据
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((Config.UDP_NEBULALINK_IP, Config.UDP_NEBULALINK_PORT))
-    logger.info(f"📡 UDP Server 启动成功，监听星云互联数据于 {Config.UDP_NEBULALINK_IP}:{Config.UDP_NEBULALINK_PORT}")
-
     # 建立 TCP Socket 准备发送给前端/ITC系统
     web_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     web_sock.connect((Config.TCP_WEB_IP, Config.TCP_WEB_PORT))
 
-    while True:
-        try:
-            data, addr = sock.recvfrom(65535)
+    # ==========================================
+    # 📡 多数据源接入: selectors 单线程多路复用
+    #   - 数据源 1: 星云互联 UDP (原有, 端口 10001)
+    #   - 数据源 2: 第三方 UDP  (新增, 端口 10011, 报文格式相同)
+    # ==========================================
+    sel = selectors.DefaultSelector()
 
-            # [1. 输入解析]
-            raw_frame = input_adapter.parse_udp_packet(data)
-            if not raw_frame or not raw_frame.vehicles:
-                continue
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((Config.UDP_NEBULALINK_IP, Config.UDP_NEBULALINK_PORT))
+    sel.register(sock, selectors.EVENT_READ)
+    logger.info(f"📡 UDP Server 启动成功，监听星云互联数据于 {Config.UDP_NEBULALINK_IP}:{Config.UDP_NEBULALINK_PORT}")
 
-            # [2. 直接透传包装 (跳过任何平滑、预测和修复)]
-            raw_pass_vehicles = []
-            for rv in raw_frame.vehicles:
-                # 把 RawVehicle 的属性原封不动地塞进 ProcessedVehicle
-                raw_pass_vehicles.append(
-                    ProcessedVehicle(
-                        original_id=rv.object_id,
-                        fixed_id=rv.object_id,  # ID 直接透传，不修复跳变
-                        x=rv.rel_x,  # 坐标直接透传，不平滑
-                        y=rv.rel_y,
-                        v=0.0,  # 透传模式不计算速度
-                        psi=0.0,  # 透传模式直接用雷达原生航向角
-                        is_predicted=False,  # 永远为 False
-                        itc_obj_type=rv.itc_obj_type,
-                        itc_sub_type=rv.itc_sub_type,
-                        plate_num=rv.plate_num,
-                        lane_no=rv.lane_no,
-                        radar_heading=rv.radar_heading,
-                        type_reliability=rv.type_reliability
-                    )
+    if getattr(Config, 'ENABLE_THIRDPARTY_INPUT', False):
+        third_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        third_sock.bind((Config.UDP_THIRDPARTY_IP, Config.UDP_THIRDPARTY_PORT))
+        sel.register(third_sock, selectors.EVENT_READ)
+        logger.info(f"📡 UDP Server 启动成功，监听第三方数据于 {Config.UDP_THIRDPARTY_IP}:{Config.UDP_THIRDPARTY_PORT}")
+
+    def handle_packet(data):
+        """单包处理: 解析 -> 直接透传包装 -> 前端下发"""
+        # [1. 输入解析] (两路数据报文格式相同, 共用适配器)
+        raw_frame = input_adapter.parse_udp_packet(data)
+        if not raw_frame or not raw_frame.vehicles:
+            return
+
+        # [2. 直接透传包装 (跳过任何平滑、预测和修复)]
+        raw_pass_vehicles = []
+        for rv in raw_frame.vehicles:
+            # 把 RawVehicle 的属性原封不动地塞进 ProcessedVehicle
+            raw_pass_vehicles.append(
+                ProcessedVehicle(
+                    original_id=rv.object_id,
+                    fixed_id=rv.object_id,  # ID 直接透传，不修复跳变
+                    x=rv.rel_x,  # 坐标直接透传，不平滑
+                    y=rv.rel_y,
+                    v=0.0,  # 透传模式不计算速度
+                    psi=0.0,  # 透传模式直接用雷达原生航向角
+                    is_predicted=False,  # 永远为 False
+                    itc_obj_type=rv.itc_obj_type,
+                    itc_sub_type=rv.itc_sub_type,
+                    plate_num=rv.plate_num,
+                    lane_no=rv.lane_no,
+                    radar_heading=rv.radar_heading,
+                    type_reliability=rv.type_reliability
                 )
-
-            mock_frame = ProcessedFrame(
-                timestamp_ms=raw_frame.timestamp_ms,
-                vehicles=raw_pass_vehicles,
-                alerts=[]  # 无算法介入，自然无异常告警
             )
 
-            # [3. 输出转换]
-            tcp_bytes_to_send = output_adapter.to_tcp_bytes(mock_frame)
+        mock_frame = ProcessedFrame(
+            timestamp_ms=raw_frame.timestamp_ms,
+            vehicles=raw_pass_vehicles,
+            alerts=[]  # 无算法介入，自然无异常告警
+        )
 
-            # [发送给前端]
-            web_sock.sendall(tcp_bytes_to_send)
+        # [3. 输出转换]
+        tcp_bytes_to_send = output_adapter.to_tcp_bytes(mock_frame)
 
+        # [发送给前端]
+        web_sock.sendall(tcp_bytes_to_send)
+
+    while True:
+        try:
+            # 多路复用等待: 任一数据源有包到达即唤醒
+            for key, _ in sel.select(timeout=1.0):
+                data, addr = key.fileobj.recvfrom(65535)
+                handle_packet(data)
         except Exception as e:
             logger.error(f"运行时异常: {e}", exc_info=True)
 

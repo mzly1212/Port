@@ -31,6 +31,13 @@ class Config:
     UDP_NEBULALINK_IP = "0.0.0.0"
     UDP_NEBULALINK_PORT = 10001  # 星云互联默认端口
 
+    # ===== UDP 第三方数据端口 =====
+    # 数据格式与星云互联相同 (8字节报文头 + Protobuf),
+    # 对方作为客户端向我们推送, 我们作为服务端监听
+    ENABLE_THIRDPARTY_INPUT = True          # 第三方数据源开关
+    UDP_THIRDPARTY_IP = "0.0.0.0"
+    UDP_THIRDPARTY_PORT = 10011             # 第三方数据监听端口
+
     # ===== web前端显示 =====
     TCP_WEB_IP = "10.28.49.196"
     TCP_WEB_PORT = 7098

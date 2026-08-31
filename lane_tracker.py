@@ -936,13 +936,18 @@ class LaneQueueTracker:
             # 🚀 固定设施身份隔离防线：
             # 1. 车辆点绝不认领固定设施的 ID (防止误绑定后设施跟随车辆移动)
             # 2. 固定设施点绝不认领车辆的 ID (防止设施瞬移进车流、污染车辆轨迹)
-            # 3. 仅"未知类型(99)且距离 <= 5m"的点允许缝合设施
+            # 3. 固定设施点绝不认领固定设施的 ID: 舱盖板等设施密集排布,
+            #    相邻间距常 < 18m (缝合分裂阈值), 设施-设施缝合会把整排
+            #    舱盖板吞成一个目标 (透传显示多个, 算法版只剩极少)。
+            #    设施静止无 ID 跳变缝合需求, 每个设施独立持有 ID, 只锚定位姿。
+            # 4. 仅"未知类型(99)且距离 <= 5m"的点允许缝合设施
             #    (兼容设备偶发把设施上报为未知类型的 ID 跳变重连)
             # ==========================================
             if self._is_fixed_facility(veh):
-                if incoming_sub_type not in FIXED_FACILITY_SUB_TYPES:
-                    if not (incoming_sub_type == 99 and dist <= 5.0):
-                        continue
+                if incoming_sub_type in FIXED_FACILITY_SUB_TYPES:
+                    continue
+                if not (incoming_sub_type == 99 and dist <= 5.0):
+                    continue
             elif incoming_sub_type in FIXED_FACILITY_SUB_TYPES:
                 continue
 

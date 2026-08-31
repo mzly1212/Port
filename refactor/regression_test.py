@@ -509,6 +509,61 @@ def main():
           max_err < 30, f'(max_err={max_err:.1f}°)')
     check('堆场车道: 无 180° 航向翻转', flips13 == 0, f'({flips13} 次)')
 
+    # ================= T14: 固定设施不去重不缝合 =================
+    # 业务规则: 舱盖板等密集排布设施, 相邻间距 < 18m (缝合分裂阈值),
+    # 设施-设施缝合会把整排舱盖板吞成一个目标
+    print('\n== T14: 固定设施不去重 ==')
+
+    def run_facility_cluster():
+        """5 个舱盖板间隔 6m 一排 (间距 < 18m 缝合阈值), 200 帧后必须全部存活"""
+        eng, mm, bearing, line_len = get_ctx()
+        cx, cy = mm.offset_lateral(A, 80.0, 30.0)
+        n_fac = 5
+        facs = [(cx + k * 6.0, cy) for k in range(n_fac)]   # 间距 6m
+        for i in range(200):
+            t = (i + 1) * 100
+            rvs = [mk_rv(14000 + k, x + random.uniform(-0.1, 0.1),
+                         y + random.uniform(-0.1, 0.1), 90.0, sub=14)
+                   for k, (x, y) in enumerate(facs)]
+            pf = eng.process_frame(RawFrame(timestamp_ms=t, vehicles=rvs))
+        ids = sorted(pv.fixed_id for pv in pf.vehicles
+                     if pv.itc_sub_type == 14)
+        # 位置锚定校验: 幸存设施应钉在锚点附近 (< 1m), 不被相邻观测拉偏
+        drifts = []
+        for pv in pf.vehicles:
+            if pv.itc_sub_type == 14:
+                near = min(math.hypot(pv.x - fx, pv.y - fy)
+                           for fx, fy in facs)
+                drifts.append(near)
+        return ids, max(drifts) if drifts else float('inf')
+
+    ids14, max_drift = run_facility_cluster()
+    check('舱盖板簇 (间距 6m): 5 个设施全部存活不被缝合吞并',
+          ids14 == [14000, 14001, 14002, 14003, 14004],
+          f'(got {len(ids14)}: {ids14})')
+    check('设施位置钉锚 (< 1m), 不被相邻观测拉偏', max_drift < 1.0,
+          f'({max_drift:.2f}m)')
+
+    def run_facility_id_jump():
+        """同一舱盖板换新 ID 重现 (设备偶发 ID 跳变): 未知类型(99) 且 <= 5m
+        的点仍可认领设施 —— 修复不能误伤这条兼容路径"""
+        eng, mm, bearing, line_len = get_ctx()
+        cx, cy = mm.offset_lateral(A, 80.0, 30.0)
+        for i in range(30):
+            t = (i + 1) * 100
+            eng.process_frame(RawFrame(timestamp_ms=t, vehicles=[
+                mk_rv(15001, cx, cy, 90.0, sub=14)]))
+        # 新 ID, 类型未知(99), 位置相同 -> 应认领老设施
+        for i in range(30):
+            t = 3000 + (i + 1) * 100
+            pf = eng.process_frame(RawFrame(timestamp_ms=t, vehicles=[
+                mk_rv(15002, cx, cy, 90.0, sub=99)]))
+        return sorted(pv.fixed_id for pv in pf.vehicles)
+
+    ids14b = run_facility_id_jump()
+    check('设施 ID 跳变兼容: 未知类型(99)近距离点仍认领老设施 ID',
+          15001 in ids14b and 15002 not in ids14b, f'({ids14b})')
+
     print(f'\n========== 结果: {PASS} PASS / {FAIL} FAIL ==========')
     return 0 if FAIL == 0 else 1
 

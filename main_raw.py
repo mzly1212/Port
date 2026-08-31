@@ -3,6 +3,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import socket
 import selectors
+import struct
 import time
 import json
 
@@ -99,10 +100,32 @@ def main():
         sel.register(third_sock, selectors.EVENT_READ, 'thirdparty')
         logger.info(f"📡 UDP Server 启动成功，监听第三方数据于 {Config.UDP_THIRDPARTY_IP}:{Config.UDP_THIRDPARTY_PORT}")
 
+    # 第三方原始数据包落盘 (按收包原样保存二进制报文)
+    thirdparty_raw_file = None
+    if getattr(Config, 'ENABLE_THIRDPARTY_INPUT', False) \
+            and getattr(Config, 'SAVE_THIRDPARTY_RAW', False):
+        raw_path = getattr(Config, 'THIRDPARTY_RAW_FILE',
+                            os.path.join(Config.BASE_DIR, "logs", "thirdparty_raw.bin"))
+        os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+        thirdparty_raw_file = open(raw_path, "ab")
+        logger.info(f"💾 第三方原始数据包落盘已开启: {raw_path} "
+                    f"(记录格式: 8B接收时刻ms + 4B包长 + 原始报文)")
+
+    def save_thirdparty_raw(data):
+        """保存第三方原始报文: [接收时刻 epoch ms][包长][原始字节]"""
+        if thirdparty_raw_file is not None:
+            thirdparty_raw_file.write(struct.pack('<QI', int(time.time() * 1000), len(data)))
+            thirdparty_raw_file.write(data)
+            thirdparty_raw_file.flush()
+
     merger = SourceMerger(stale_sec=1.0)
 
     def handle_packet(data, source):
         """单包处理: 解析 -> 透传包装 -> 多源合并 -> 前端下发"""
+        # [0. 第三方原始包落盘] (保存动作先于解析: 解析失败的坏包也留痕)
+        if source == 'thirdparty':
+            save_thirdparty_raw(data)
+
         # [1. 输入解析] (两路数据报文格式相同, 共用适配器)
         raw_frame = input_adapter.parse_udp_packet(data)
         if not raw_frame:

@@ -41,6 +41,13 @@ class Config:
     UDP_THIRDPARTY_IP = "0.0.0.0"
     UDP_THIRDPARTY_PORT = 10011             # 第三方数据监听端口
 
+    # ===== 第三方原始数据包落盘 =====
+    # 按收包原样保存二进制报文 (含 8 字节报文头), 记录格式:
+    #   [8B 接收时刻 epoch 毫秒 (uint64 LE)][4B 包长 (uint32 LE)][原始报文]
+    # 关闭后重新打开为追加写入 (不改名轮转, 需要时手工转存)
+    SAVE_THIRDPARTY_RAW = False
+    THIRDPARTY_RAW_FILE = os.path.join(BASE_DIR, "logs", "thirdparty_raw.bin")
+
     # ===== web前端显示 =====
     TCP_WEB_IP = "10.28.49.196"
     TCP_WEB_PORT = 7098

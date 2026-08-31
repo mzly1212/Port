@@ -564,6 +564,39 @@ def main():
     check('设施 ID 跳变兼容: 未知类型(99)近距离点仍认领老设施 ID',
           15001 in ids14b and 15002 not in ids14b, f'({ids14b})')
 
+    # ================= T15: 固定设施低频刷新节流 =================
+    # 业务规则: 设施数据来自第三方低频通道, 状态每分钟刷新一次
+    print('\n== T15: 设施刷新节流 ==')
+
+    def run_facility_throttle():
+        """设施 10Hz 上报; 30s 起上报坐标整体偏移 8m:
+        60s 节流窗口内位姿必须纹丝不动, 满 1 分钟才刷新一次"""
+        eng, mm, bearing, line_len = get_ctx()
+        cx, cy = mm.offset_lateral(A, 80.0, 30.0)
+        outs = []
+        for i in range(900):     # 90s @ 10Hz
+            t = (i + 1) * 100
+            ox = 0.0 if i < 300 else 8.0   # 30s 起第三方修正了坐标 (+8m)
+            pf = eng.process_frame(RawFrame(timestamp_ms=t, vehicles=[
+                mk_rv(16001, cx + ox + random.uniform(-0.1, 0.1),
+                      cy + random.uniform(-0.1, 0.1), 90.0, sub=14)]))
+            for pv in pf.vehicles:
+                if pv.fixed_id == 16001:
+                    outs.append((t, pv.x))
+        return outs, cx
+
+    outs15, cx15 = run_facility_throttle()
+    check('设施全程存活不被超时清理', len(outs15) > 800,
+          f'(输出帧 {len(outs15)}/900)')
+    during = [x for t, x in outs15 if 32000 <= t <= 58000]   # 节流窗口内
+    after = [x for t, x in outs15 if 62000 <= t <= 90000]   # 首次刷新后
+    max_during = max(abs(x - cx15) for x in during)
+    max_after = max(x for x in after)
+    check('节流窗口内 (30~58s): 位姿不跟随第三方坐标跳变 (< 0.5m)',
+          max_during < 0.5, f'({max_during:.2f}m)')
+    check('满 1 分钟后刷新生效 (向新坐标收敛 > 0.5m)',
+          max_after - cx15 > 0.5, f'(偏移 {max_after - cx15:.2f}m)')
+
     print(f'\n========== 结果: {PASS} PASS / {FAIL} FAIL ==========')
     return 0 if FAIL == 0 else 1
 

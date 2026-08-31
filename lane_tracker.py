@@ -29,7 +29,9 @@ FACILITY_ANCHOR_SAMPLES = 10     # 锚点确认采样帧数 (10Hz 下约 1 秒)
 FACILITY_JITTER_DEADZONE = 0.5   # 抖动静区：偏移 <= 0.5m 视为传感器波动，坐标钉死在锚点
 FACILITY_MAX_DRIFT = 3.0         # 误绑定阈值：偏移 > 3.0m 判定为车辆误绑定，拒绝移动
 FACILITY_REANCHOR_MS = 15000     # 持续大幅偏移超过 15 秒才重新锚定 (兼容舱盖板被吊装搬运)
-FACILITY_TIMEOUT_MS = 10000      # 固定设施断检存活期 (防止过车遮挡导致平台图标闪烁)
+FACILITY_REFRESH_MS = 60000      # 设施状态刷新节流：设施数据来自第三方低频专用通道，
+                                 # 每分钟刷新一次位姿已足够；窗口内的量测仅作心跳续命
+FACILITY_TIMEOUT_MS = 70000      # 固定设施断检存活期 (> FACILITY_REFRESH_MS，兼容第三方低频丢拍)
 
 # ==========================================
 # 🚗 行驶方向滞回状态机参数 (根治车头 180° 来回翻转)
@@ -164,6 +166,7 @@ class VehicleState:
         self.anchor_y = None
         self.anchor_obs = deque(maxlen=FACILITY_ANCHOR_SAMPLES)  # 确认期观测采样 (中位数免疫误绑定尖峰)
         self.drift_since = None            # 持续大幅偏移的起始时间 (用于真实搬运后重新锚定)
+        self.last_facility_refresh_t = current_time  # 上次设施状态刷新时刻 (低频节流)
 
     def update_s_and_chase(self, current_time, raw_s):
         """处理真实坐标更新，并触发/维持推演车追击状态"""
@@ -544,6 +547,19 @@ class LaneQueueTracker:
                     rv.radar_heading = getattr(Config, 'ENTRY_HEADING_INTER_R', 162.0)
 
             old_veh = self.active_vehicles.get(fixed_id)
+
+            # ==========================================
+            # 🚀 固定设施低频刷新节流：
+            # 设施数据来自第三方低频专用通道, 状态每分钟刷新一次已足够。
+            # 非刷新窗口内的设施量测仅作心跳续命 (防超时清理), 位姿保持不变
+            # —— 位置不动 + 航向冻结, 前端图标完全静止。
+            # ==========================================
+            if old_veh is not None and self._is_fixed_facility(old_veh) \
+                    and rv.itc_sub_type in FIXED_FACILITY_SUB_TYPES:
+                if current_time - old_veh.last_facility_refresh_t < FACILITY_REFRESH_MS:
+                    old_veh.last_radar_time = current_time   # 心跳续命
+                    continue                                  # 跳过本帧量测
+                old_veh.last_facility_refresh_t = current_time
 
             # ==========================================
             # 🚀 固定设施身份防劫持：

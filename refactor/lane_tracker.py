@@ -44,7 +44,7 @@ from data import ProcessedVehicle
 from config import Config
 from vehicle_state import VehicleState
 from tracker_params import (
-    FIXED_FACILITY_SUB_TYPES, FACILITY_TIMEOUT_MS,
+    FIXED_FACILITY_SUB_TYPES, FACILITY_TIMEOUT_MS, FACILITY_REFRESH_MS,
     PRED_SPEED_DECAY_TAU, PRED_MIN_SPEED,
     PRED_MAX_GAP_BASE, PRED_MAX_GAP_RATIO, CHASE_MAX_SPEED,
     IDM_BRAKE_DIST, IDM_BRAKE_DECEL,
@@ -142,6 +142,16 @@ class LaneQueueTracker:
             if self.map_mgr.zone_mgr.is_in_zone(rv.rel_x, rv.rel_y, 'AREA_INTER_R'):
                 rv.radar_heading = getattr(Config, 'ENTRY_HEADING_INTER_R', 162.0)
             return True
+
+        # ---- 固定设施低频刷新节流 ----
+        # 设施数据来自第三方低频专用通道, 状态每分钟刷新一次已足够。
+        # 非刷新窗口内的设施量测仅作心跳续命 (防超时清理), 位姿保持不变
+        # —— 位置不动 + 航向冻结, 前端图标完全静止。
+        if old_veh.is_fixed_facility and rv.itc_sub_type in FIXED_FACILITY_SUB_TYPES:
+            if current_time - old_veh.last_facility_refresh_t < FACILITY_REFRESH_MS:
+                old_veh.last_radar_time = current_time   # 心跳续命
+                return False                              # 跳过本帧量测
+            old_veh.last_facility_refresh_t = current_time
 
         _old_sub = old_veh.attrs.get("itc_sub_type", 99)
         if rv.itc_sub_type in FIXED_FACILITY_SUB_TYPES \

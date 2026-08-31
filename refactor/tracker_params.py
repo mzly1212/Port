@@ -27,7 +27,11 @@ FACILITY_ANCHOR_SAMPLES = 10     # 锚点确认采样帧数 (10Hz 下约 1 秒)
 FACILITY_JITTER_DEADZONE = 0.5   # 抖动静区: 偏移 <= 0.5m 视为波动, 坐标钉死
 FACILITY_MAX_DRIFT = 3.0         # 误绑定阈值: 偏移 > 3m 判定为车辆误绑定
 FACILITY_REANCHOR_MS = 15000     # 持续大幅偏移超 15 秒才重新锚定 (兼容吊装搬运)
-FACILITY_TIMEOUT_MS = 10000      # 断检存活期 (防过车遮挡导致图标闪烁)
+FACILITY_REFRESH_MS = 60000     # 设施状态刷新节流: 设施数据来自第三方低频
+                                 # 专用通道, 每分钟刷新一次位姿已足够; 窗口内
+                                 # 的量测仅作心跳续命, 位姿保持不变
+FACILITY_TIMEOUT_MS = 70000      # 断检存活期 (> FACILITY_REFRESH_MS, 兼容
+                                 # 第三方低频通道偶尔丢一拍不闪图标)
 
 # ==========================================
 # 二、行驶方向滞回状态机 (根治车头 180° 翻转)

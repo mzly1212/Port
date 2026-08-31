@@ -85,6 +85,7 @@ class VehicleState:
         self.anchor_y = None
         self.anchor_obs = deque(maxlen=FACILITY_ANCHOR_SAMPLES)
         self.drift_since = None
+        self.last_facility_refresh_t = current_time  # 上次状态刷新时刻 (低频节流)
 
         # ---- 变道/上轨平滑动画 ----
         self.is_changing_lane = False

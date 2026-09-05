@@ -76,9 +76,68 @@ def main():
         replay_file = open(raw_replay_path, "a", encoding="utf-8")
         logger.info(f"💾 原始数据落盘已开启，将保存至: {raw_replay_path}")
 
-    # 建立 TCP Socket 准备发送给前端/ITC系统
-    web_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    web_sock.connect((Config.TCP_WEB_IP, Config.TCP_WEB_PORT))
+    # ==========================================
+    # 🔌 前端 TCP 连接管理: 断线自动重连
+    #   前端重启/网络抖动会导致 Broken pipe —— 发送失败时关闭死连接,
+    #   断连期间照常接收解析数据, 定期重试重连。
+    #   ⚠ 必须带发送超时: 前端 TCP 层活着但应用不收数据 (半死) 时,
+    #   无超时的 sendall 会无限阻塞冻结主循环 -> UDP 缓冲撑爆静默丢包。
+    # ==========================================
+    web_timeout = getattr(Config, 'WEB_SEND_TIMEOUT', 2.0)
+    web_retry = getattr(Config, 'WEB_RECONNECT_INTERVAL', 5.0)
+
+    def connect_web():
+        """建立前端 TCP 连接, 失败则定期重试 (阻塞直至连上)"""
+        while True:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(web_timeout)
+                s.connect((Config.TCP_WEB_IP, Config.TCP_WEB_PORT))
+                logger.info(f"🖥️ 前端 TCP 连接成功: {Config.TCP_WEB_IP}:{Config.TCP_WEB_PORT}")
+                return s
+            except Exception as e:
+                logger.error(f"前端 TCP 连接失败 ({e}), {web_retry:.0f} 秒后重试: "
+                             f"{Config.TCP_WEB_IP}:{Config.TCP_WEB_PORT}")
+                time.sleep(web_retry)
+
+    web_sock = connect_web()
+    last_reconnect_attempt = 0.0
+
+    def send_to_web(tcp_bytes):
+        """向前端发送数据, 断线时自动重连; 返回是否发送成功"""
+        nonlocal web_sock, last_reconnect_attempt
+        if web_sock is None:
+            now = time.time()
+            if now - last_reconnect_attempt < web_retry:
+                return False   # 距上次重试不足间隔, 本帧跳过发送
+            last_reconnect_attempt = now
+            # 单次尝试 (带超时不阻塞事件循环, 失败等下个窗口再试)
+            try:
+                web_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                web_sock.settimeout(web_timeout)
+                web_sock.connect((Config.TCP_WEB_IP, Config.TCP_WEB_PORT))
+                logger.info(f"🖥️ 前端 TCP 重连成功: {Config.TCP_WEB_IP}:{Config.TCP_WEB_PORT}")
+            except OSError as e:
+                logger.error(f"前端 TCP 重连失败 ({e}), {web_retry:.0f} 秒后重试")
+                web_sock = None
+                return False
+        try:
+            web_sock.sendall(tcp_bytes)
+            return True
+        except OSError as e:
+            # Broken pipe / Connection reset / 发送超时: 连接已不可信。
+            # 超时时可能已写入半帧, 该 TCP 流不可复用, 必须关闭重建
+            if isinstance(e, socket.timeout):
+                reason = "发送超时 (前端疑似卡死未收数据)"
+            else:
+                reason = str(e)
+            logger.error(f"前端 TCP 发送失败 ({reason}), 进入重连模式")
+            try:
+                web_sock.close()
+            except OSError:
+                pass
+            web_sock = None
+            return False
 
     # ==========================================
     # 📡 多数据源接入: selectors 单线程多路复用
@@ -164,9 +223,9 @@ def main():
             alerts=[]  # 无算法介入，自然无异常告警
         )
 
-        # [4. 输出转换 + 发送给前端]
+        # [4. 输出转换 + 发送给前端] (前端断连时自动跳过)
         tcp_bytes_to_send = output_adapter.to_tcp_bytes(mock_frame)
-        web_sock.sendall(tcp_bytes_to_send)
+        send_to_web(tcp_bytes_to_send)
 
     while True:
         try:

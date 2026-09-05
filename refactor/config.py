@@ -51,6 +51,11 @@ class Config:
     # ===== web前端显示 =====
     TCP_WEB_IP = "10.28.49.196"
     TCP_WEB_PORT = 7098
+    # 前端 TCP 发送/连接超时(秒): 前端 TCP 层活着但应用不收数据时,
+    # 无超时的 sendall 会无限阻塞冻结主循环 -> UDP 缓冲撑爆静默丢包
+    WEB_SEND_TIMEOUT = 2.0
+    # 断线后自动重连尝试间隔(秒)
+    WEB_RECONNECT_INTERVAL = 5.0
 
     # 是否在运行服务端时保存回放数据 (落盘为 jsonl 格式)
     SAVE_REPLAY_DATA = False

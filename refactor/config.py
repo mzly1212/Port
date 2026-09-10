@@ -48,9 +48,13 @@ class Config:
     SAVE_THIRDPARTY_RAW = False
     THIRDPARTY_RAW_FILE = os.path.join(BASE_DIR, "logs", "thirdparty_raw.bin")
 
-    # ===== web前端显示 =====
-    TCP_WEB_IP = "10.28.49.196"
-    TCP_WEB_PORT = 7098
+    # ===== web前端显示 (多目标推送) =====
+    # 处理后的数据会推送给列表中的所有前端, 每个目标独立连接/独立断线重连,
+    # 单个前端故障不影响其他目标。新增前端: 在此追加 (ip, port) 即可。
+    WEB_TARGETS = [
+        ("10.28.49.196", 7098), # 内部前端
+        ("10.28.29.135", 6056), # 客户前端
+    ]
     # 前端 TCP 发送/连接超时(秒): 前端 TCP 层活着但应用不收数据时,
     # 无超时的 sendall 会无限阻塞冻结主循环 -> UDP 缓冲撑爆静默丢包
     WEB_SEND_TIMEOUT = 2.0

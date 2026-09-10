@@ -236,7 +236,6 @@ WEB_TARGETS = [
 ]
 WEB_SEND_TIMEOUT = 2.0          # 发送/连接超时(秒)
 WEB_RECONNECT_INTERVAL = 5.0    # 断线重连尝试间隔(秒)
-# 未配置 WEB_TARGETS 时回退到旧单目标 TCP_WEB_IP / TCP_WEB_PORT
 ```
 
 多目标推送（`web_sender.py` 的 `WebSender`，三个入口共用）：

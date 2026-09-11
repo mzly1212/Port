@@ -104,4 +104,5 @@ class WebSender:
             except OSError:
                 pass
             self.socks[i] = None
+            self.last_attempt[i] = time.time()  # 记录失败时刻, 按重连周期节流, 防止每帧狂连刷屏
             return False

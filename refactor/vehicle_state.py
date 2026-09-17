@@ -14,6 +14,7 @@ from collections import deque
 
 import numpy as np
 
+from config import Config
 from tracker_params import (
     FIXED_FACILITY_SUB_TYPES, FACILITY_ANCHOR_SAMPLES,
     FACILITY_JITTER_DEADZONE, FACILITY_MAX_DRIFT, FACILITY_REANCHOR_MS,
@@ -23,8 +24,15 @@ from tracker_params import (
     CHASE_TRIGGER_GAP_MS, CHASE_TRIGGER_DIST,
     HEADING_NOISE_JUMP, OFFLANE_MIN_MOTION, OFFLANE_HEADING_ERRATIC,
     HEADING_FLIP_MARK, HEADING_FLIP_TRUST_MS,
+    DUICHANG_L_DEADZONE, DUICHANG_S_DEADZONE, DUICHANG_STATIC_V,
+    DUICHANG_XY_ALPHA,
     ang_diff_deg,
 )
+
+# 堆场车道清单 (与 lane_tracker.py 同源, 均只读引用 config.py,
+# 避免 vehicle_state <-> lane_tracker 循环导入)
+DUICHANG_LANES = frozenset(
+    getattr(Config, 'SPECIAL_LINES', {}).get('DUICHANG', []))
 
 
 class VehicleState:
@@ -131,7 +139,8 @@ class VehicleState:
         if self.is_fixed_facility:
             return self._update_fixed_facility_xy(new_x, new_y, current_time)
 
-        alpha = 0.3  # 30% 信任新雷达点, 70% 沿用上一帧物理惯性
+        # 🚗 堆场内预滤波更保守 (0.3 -> 0.15): 噪声逐帧吃进更慢, 位置更稳
+        alpha = DUICHANG_XY_ALPHA if self.lane_id in DUICHANG_LANES else 0.3
         self.raw_x = self.raw_x * (1 - alpha) + new_x * alpha
         self.raw_y = self.raw_y * (1 - alpha) + new_y * alpha
         return self.raw_x, self.raw_y
@@ -220,8 +229,14 @@ class VehicleState:
     def update_l(self, raw_l):
         """
         横向偏移动态低通: 偏差大(变道中)快跟随, 偏差小(巡航)强抗噪。
+
+        堆场横向偏移死区: 堆场内车辆密集排队/静止吊装, 真实横向
+        位置基本不变 —— 偏移 <= DUICHANG_L_DEADZONE 直接视为噪声,
+        滤波值钉死不动, 防止位置噪声逐帧吃进造成左右小幅游走。
         """
         err = abs(raw_l - self.filtered_l)
+        if self.lane_id in DUICHANG_LANES and err <= DUICHANG_L_DEADZONE:
+            return self.filtered_l
         alpha = 0.5 if err > 0.6 else 0.2
         self.filtered_l = self.filtered_l * (1 - alpha) + raw_l * alpha
         return self.filtered_l
@@ -312,6 +327,14 @@ class VehicleState:
 
         self.v = self.update_and_estimate_speed(current_time, raw_s)
         self.target_s = raw_s
+
+        # 🚗 堆场纵向死区: 排队/吊装车辆真实纵向位置基本不变,
+        # 低速(|v|<=DUICHANG_STATIC_V)且 |Δs| <= 死区时视为噪声, s 钉死不动。
+        # (静止车方向状态机无法确认 -> 棘轮机制不生效 -> 纵向噪点逐帧
+        #  直通输出, 是堆场纵向小幅晃动的主因; 移动车超过死区全量更新)
+        if self.lane_id in DUICHANG_LANES and self.v <= DUICHANG_STATIC_V \
+                and abs(raw_s - self.s) <= DUICHANG_S_DEADZONE:
+            return
 
         was_predicted = (current_time - self.last_radar_time > CHASE_TRIGGER_GAP_MS)
 

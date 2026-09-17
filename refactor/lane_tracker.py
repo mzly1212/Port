@@ -52,6 +52,8 @@ from tracker_params import (
     SUTURE_SPLIT_DIST, SUTURE_FACILITY_UNKNOWN_DIST,
     SUTURE_HEADING_VETO_GLOBAL, SUTURE_REJOIN_ANIM_MAX, CHASE_TRIGGER_DIST,
     DEDUP_LANE_S_WINDOW, DEDUP_LANE_V_DIFF, DEDUP_OFFLANE_DIST,
+    DUICHANG_SUTURE_SPLIT_DIST, DUICHANG_SUTURE_REJOIN_DIST,
+    DUICHANG_DEDUP_S_WINDOW,
     HEADING_MAX_RATE, HEADING_MOTION_CONFLICT,
     LANE_CHANGE_CONFIRM_FRAMES, LANE_CHANGE_CONFIRM_DIST, REENTRY_BLIP_MS,
     NEW_VEHICLE_GRACE_MS, OFFLANE_TIMEOUT_MS, ONLANE_TIMEOUT_MS,
@@ -388,16 +390,28 @@ class LaneQueueTracker:
                     continue
 
             # ---- 核心缝合 ----
+            # 🚗 堆场内单独收紧: 集卡密集排队 (车间距 ~8m), 全局距离
+            #    会把邻车误认领 -> 航迹串位 -> 前端左右横移
             is_match = False
 
-            # 场景 1: 断联重连
-            max_allow_dist = min(SUTURE_REJOIN_DIST_MAX,
-                                 SUTURE_REJOIN_DIST_BASE + veh.v * dt_sec)
-            if time_diff > SUTURE_GAP_MS and dist < max_allow_dist:
-                is_match = True
-            # 场景 2: 极近距离分裂噪点
-            elif dist < SUTURE_SPLIT_DIST:
-                is_match = True
+            if veh.lane_id in DUICHANG_LANES:
+                # 场景 1: 断联重连 (堆场车基本静止, 收紧基础距离)
+                max_allow_dist = min(SUTURE_REJOIN_DIST_MAX,
+                                     DUICHANG_SUTURE_REJOIN_DIST + veh.v * dt_sec)
+                if time_diff > SUTURE_GAP_MS and dist < max_allow_dist:
+                    is_match = True
+                # 场景 2: 极近距离分裂噪点 (收紧到 < 排队车间距)
+                elif dist < DUICHANG_SUTURE_SPLIT_DIST:
+                    is_match = True
+            else:
+                # 场景 1: 断联重连
+                max_allow_dist = min(SUTURE_REJOIN_DIST_MAX,
+                                     SUTURE_REJOIN_DIST_BASE + veh.v * dt_sec)
+                if time_diff > SUTURE_GAP_MS and dist < max_allow_dist:
+                    is_match = True
+                # 场景 2: 极近距离分裂噪点
+                elif dist < SUTURE_SPLIT_DIST:
+                    is_match = True
 
             if is_match and dist < min_dist:
                 min_dist = dist
@@ -699,6 +713,10 @@ class LaneQueueTracker:
         """
         deduped = {}
         for lane_id, items in lane_groups.items():
+            # 🚗 堆场在轨去重窗口单独收紧: 排队车间距 ~8m,
+            #    全局 15m 窗口会把邻车当分裂幽灵吞掉
+            dedup_s_window = DUICHANG_DEDUP_S_WINDOW if lane_id in DUICHANG_LANES \
+                else DEDUP_LANE_S_WINDOW
             items.sort(key=lambda x: x[1], reverse=True)
 
             survivors = []
@@ -730,7 +748,7 @@ class LaneQueueTracker:
                                      or veh.heading_recently_flipped(current_time)):
                         continue
                     s_diff = abs(sv_s - s_val)
-                    if s_diff < DEDUP_LANE_S_WINDOW \
+                    if s_diff < dedup_s_window \
                             and abs(sv_veh.v - veh.v) < DEDUP_LANE_V_DIFF:
                         if sv_veh.last_radar_time >= veh.last_radar_time:
                             ghosts_to_delete.add(veh.fixed_id)

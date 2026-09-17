@@ -20,9 +20,35 @@ FIXED_FACILITY_SUB_TYPES = {13, 14}
 # 业务上这些车道不存在逆行, 车头航向严格锁定为车道正向:
 # 跳过方向状态机 -1 分支 / 逆行先验 / 雷达反向兼容等一切翻转逻辑。
 # (车道清单在 config.py SPECIAL_LINES['DUICHANG'], 此处只读引用)
+#
+# 🚗 堆场密集区特化 (修复车辆左右反复横移):
+#   堆场内集卡密集排队 (车间距常 ~8m), 全局阈值为稀疏车流设计,
+#   在堆场会造成两类混乱:
+#   1. 2D 缝合/在轨去重距离过宽 -> 邻车被误认领/吞并, 航迹互相
+#      串位, 前端表现为车辆左右横移
+#   2. 横向滤波无死区 -> 位置噪声逐帧吃进, 输出小幅游走
+#   故堆场内单独收紧: 缝合距离 < 排队车间距, 去重窗口 < 车间距,
+#   横向偏移死区内坐标钉死不动。
 # ==========================================
 DUICHANG_LANES = frozenset(
     getattr(Config, 'SPECIAL_LINES', {}).get('DUICHANG', []))
+
+DUICHANG_SUTURE_SPLIT_DIST = 6.0    # 堆场 2D 缝合-极近分裂认领距离(米):
+                                   # < 排队车间距 8m, 防止新 ID 点认领邻车
+DUICHANG_SUTURE_REJOIN_DIST = 10.0  # 堆场 2D 缝合-断联重连基础距离(米):
+                                   # 堆场车基本静止, 重捕点离原位不远
+DUICHANG_DEDUP_S_WINDOW = 5.0       # 堆场在轨去重 S 差窗口(米):
+                                   # 全局 15m 会把 8m 间距的排队邻车吞并
+DUICHANG_L_DEADZONE = 0.5           # 堆场横向偏移死区(米):
+                                   # 偏移 <= 0.5m 视为噪声, 滤波值钉死不动
+DUICHANG_S_DEADZONE = 0.5           # 堆场纵向偏移死区(米):
+                                   # |Δs| <= 0.5m 且低速时 s 钉死不动 —— 静止车
+                                   # 方向状态机无法确认, 棘轮不保护, 纵向噪点
+                                   # 逐帧直通是纵向晃动的主因
+DUICHANG_STATIC_V = 1.0             # 纵向死区启用的速度门限(m/s):
+                                   # 仅低速车钉死, 防止慢速移动车步进式跳变
+DUICHANG_XY_ALPHA = 0.15            # 堆场坐标预滤波系数:
+                                   # 全局 0.3 -> 0.15, 噪声逐帧吃进更慢
 
 # 固定设施锚定参数
 FACILITY_ANCHOR_SAMPLES = 10     # 锚点确认采样帧数 (10Hz 下约 1 秒)
@@ -183,6 +209,14 @@ class VehicleState:
         self.v = self.update_and_estimate_speed(current_time, raw_s)
         self.target_s = raw_s  # 物理层永远保持为真实的雷达纵向坐标
 
+        # 🚗 堆场纵向死区: 排队/吊装车辆真实纵向位置基本不变,
+        # 低速(|v|<=DUICHANG_STATIC_V)且 |Δs| <= 死区时视为噪声, s 钉死不动。
+        # (静止车方向状态机无法确认 -> 棘轮机制不生效 -> 纵向噪点逐帧
+        #  直通输出, 是堆场纵向小幅晃动的主因; 移动车超过死区全量更新)
+        if self.lane_id in DUICHANG_LANES and self.v <= DUICHANG_STATIC_V \
+                and abs(raw_s - self.s) <= DUICHANG_S_DEADZONE:
+            return
+
         # 2. 判断是否刚从断联中恢复
         was_predicted = (current_time - self.last_radar_time > 100) # 300
 
@@ -216,8 +250,14 @@ class VehicleState:
         - 偏差大 (> 0.6m, 变道/入轨修正中): alpha=0.5 快速跟随真实横移
         - 偏差小 (正常巡航): alpha=0.2 极度平滑抗噪
         旧的固定 alpha=0.2 会让变道时的横向偏移收敛滞后数秒。
+
+        🚗 堆场横向偏移死区: 堆场内车辆密集排队/静止吊装, 真实横向
+        位置基本不变 —— 偏移 <= DUICHANG_L_DEADZONE 直接视为噪声,
+        滤波值钉死不动, 防止位置噪声逐帧吃进造成左右小幅游走。
         """
         err = abs(raw_l - self.filtered_l)
+        if self.lane_id in DUICHANG_LANES and err <= DUICHANG_L_DEADZONE:
+            return self.filtered_l
         alpha = 0.5 if err > 0.6 else 0.2
         self.filtered_l = self.filtered_l * (1 - alpha) + raw_l * alpha
         return self.filtered_l
@@ -238,7 +278,8 @@ class VehicleState:
         if self.attrs.get("itc_sub_type", 99) in FIXED_FACILITY_SUB_TYPES:
             return self._update_fixed_facility_xy(new_x, new_y, current_time)
 
-        alpha = 0.3  # 30% 信任新雷达点，70% 沿用上一帧物理惯性
+        # 🚗 堆场内预滤波更保守 (0.3 -> 0.15): 噪声逐帧吃进更慢, 位置更稳
+        alpha = DUICHANG_XY_ALPHA if self.lane_id in DUICHANG_LANES else 0.3
         self.raw_x = self.raw_x * (1 - alpha) + new_x * alpha
         self.raw_y = self.raw_y * (1 - alpha) + new_y * alpha
         return self.raw_x, self.raw_y
@@ -983,19 +1024,30 @@ class LaneQueueTracker:
 
             # ==========================================
             # 核心缝合：完整复用原版的两类经典场景
+            # 🚗 堆场内单独收紧: 集卡密集排队 (车间距 ~8m), 全局距离
+            #    会把邻车误认领 -> 航迹串位 -> 前端左右横移
             # ==========================================
             is_match = False
 
-            # 场景 1: 无论是否换道/离线，只要断联且在合理距离内，大概率是它
-            max_allow_dist = min(70.0, 30.0 + veh.v * dt_sec)
-            if time_diff > 100 and dist < max_allow_dist:
-                is_match = True
+            if veh.lane_id in DUICHANG_LANES:
+                # 场景 1: 断联重连 (堆场车基本静止, 收紧基础距离)
+                max_allow_dist = min(70.0, DUICHANG_SUTURE_REJOIN_DIST + veh.v * dt_sec)
+                if time_diff > 100 and dist < max_allow_dist:
+                    is_match = True
+                # 场景 2: 极近距离分裂噪点 (收紧到 < 排队车间距)
+                elif dist < DUICHANG_SUTURE_SPLIT_DIST:
+                    is_match = True
+            else:
+                # 场景 1: 无论是否换道/离线，只要断联且在合理距离内，大概率是它
+                max_allow_dist = min(70.0, 30.0 + veh.v * dt_sec)
+                if time_diff > 100 and dist < max_allow_dist:
+                    is_match = True
 
-            # 场景 2: 极近距离雷达瞬间分裂噪点
-            # (即使 time_diff <= 100 甚至本帧已匹配过，只要 < 20米，均强行认领！
-            # 认领后，外部的 `if fixed_id in current_radar_ids: continue` 会将分裂噪点作为重复项完美抹除)
-            elif dist < 18.0:
-                is_match = True
+                # 场景 2: 极近距离雷达瞬间分裂噪点
+                # (即使 time_diff <= 100 甚至本帧已匹配过，只要 < 20米，均强行认领！
+                # 认领后，外部的 `if fixed_id in current_radar_ids: continue` 会将分裂噪点作为重复项完美抹除)
+                elif dist < 18.0:
+                    is_match = True
 
             if is_match and dist < min_dist:
                 min_dist = dist
@@ -1113,6 +1165,11 @@ class LaneQueueTracker:
             # 按 s 降序排序
             items.sort(key=lambda x: x[1], reverse=True)
 
+            # 🚗 堆场在轨去重窗口单独收紧: 排队车间距 ~8m,
+            #    全局 15m 窗口会把邻车当分裂幽灵吞掉
+            dedup_s_window = DUICHANG_DEDUP_S_WINDOW if lane_id in DUICHANG_LANES \
+                else DEDUP_LANE_S_WINDOW
+
             # ----- 去重逻辑 (全对比较, 取代旧的仅相邻比较) -----
             # 旧策略只比较排序后相邻元素, A和C应合并但B在中间时漏判。
             # 新策略: 每个新车检查与所有已有 survivor 的 S 差和速度差。
@@ -1130,7 +1187,7 @@ class LaneQueueTracker:
                     if self._is_dedup_exempt(sv_veh):
                         continue
                     s_diff = abs(sv_s - s_val)
-                    if s_diff < DEDUP_LANE_S_WINDOW and abs(sv_veh.v - veh.v) < DEDUP_LANE_V_DIFF:
+                    if s_diff < dedup_s_window and abs(sv_veh.v - veh.v) < DEDUP_LANE_V_DIFF:
                         if sv_veh.last_radar_time >= veh.last_radar_time:
                             ghosts_to_delete.add(veh.fixed_id)
                         else:
